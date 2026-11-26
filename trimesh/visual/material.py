@@ -24,6 +24,24 @@ except BaseException as E:
 _eps = 1e-5
 
 
+def _first_float(value):
+    """
+    Coerce a scalar or a parsed MTL token list (e.g.
+    ``["1.50"]``) to a float, returning None when it
+    cannot be interpreted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        value = value[0]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class Material(util.ABC):
     def __init__(self, *args, **kwargs):
         raise NotImplementedError("must be subclassed!")
@@ -72,6 +90,10 @@ class SimpleMaterial(Material):
         specular=None,
         glossiness=None,
         name=None,
+        index_of_refraction=None,
+        dissolve=None,
+        transmission_filter=None,
+        illumination_model=None,
         **kwargs,
     ):
         # save image
@@ -85,8 +107,79 @@ class SimpleMaterial(Material):
         # save Ns
         self.glossiness = glossiness
 
+        # optional common MTL properties: `Ni` (index of
+        # refraction), `d`/`Tr` (dissolve / opacity), `Tf`
+        # (transmission filter) and `illum` (illumination model).
+        # Storing them as typed attributes lets `to_obj` round
+        # trip them and lets `__hash__` distinguish materials that
+        # differ only in these values so they aren't merged on
+        # export.
+        self.index_of_refraction = (
+            None if index_of_refraction is None else float(index_of_refraction)
+        )
+        self.dissolve = None if dissolve is None else float(dissolve)
+        if transmission_filter is None:
+            self.transmission_filter = None
+        else:
+            self.transmission_filter = tuple(float(x) for x in transmission_filter)
+        self.illumination_model = (
+            None if illumination_model is None else int(float(illumination_model))
+        )
+
+        # also accept the MTL-native kwarg names (`ni`, `d`, `Tr`,
+        # `illum`, `Tf`) including raw token lists, for callers
+        # that construct materials directly from parsed MTL entries
+        if self.index_of_refraction is None:
+            ior = _first_float(kwargs.get("ni"))
+            if ior is not None:
+                self.index_of_refraction = ior
+        if self.dissolve is None:
+            opacity = _first_float(kwargs.get("d"))
+            if opacity is not None:
+                self.dissolve = opacity
+            else:
+                transparency = _first_float(kwargs.get("tr"))
+                if transparency is not None:
+                    self.dissolve = 1.0 - transparency
+        if self.transmission_filter is None and "tf" in kwargs:
+            try:
+                self.transmission_filter = tuple(float(x) for x in kwargs["tf"])
+            except (TypeError, ValueError):
+                pass
+        if self.illumination_model is None:
+            illum = _first_float(kwargs.get("illum"))
+            if illum is not None:
+                self.illumination_model = int(illum)
+
         # save other keyword arguments
         self.kwargs = kwargs
+
+    @property
+    def ni(self):
+        """MTL-native alias for the index of refraction (`Ni`)."""
+        return self.index_of_refraction
+
+    @ni.setter
+    def ni(self, value):
+        self.index_of_refraction = None if value is None else float(value)
+
+    @property
+    def illum(self):
+        """MTL-native alias for the illumination model (`illum`)."""
+        return self.illumination_model
+
+    @illum.setter
+    def illum(self, value):
+        self.illumination_model = None if value is None else int(float(value))
+
+    @property
+    def d(self):
+        """MTL-native alias for dissolve / opacity (`d`)."""
+        return self.dissolve
+
+    @d.setter
+    def d(self, value):
+        self.dissolve = None if value is None else float(value)
 
     def to_color(self, uv):
         return color.uv_to_color(uv, self.image)
@@ -126,6 +219,18 @@ class SimpleMaterial(Material):
             "Ks {:0.8f} {:0.8f} {:0.8f}".format(*Ks),
             f"Ns {self.glossiness:0.8f}",
         ]
+
+        # common optional MTL fields, only emitted when a value
+        # was explicitly provided so materials without them keep
+        # their previous exact export behavior
+        if self.index_of_refraction is not None:
+            mtl.append(f"Ni {self.index_of_refraction:0.8f}")
+        if self.dissolve is not None:
+            mtl.append(f"d {self.dissolve:0.8f}")
+        if self.transmission_filter is not None:
+            mtl.append("Tf " + " ".join(f"{v:0.8f}" for v in self.transmission_filter))
+        if self.illumination_model is not None:
+            mtl.append(f"illum {int(self.illumination_model)}")
 
         # collect the OBJ data into files
         data = {}
@@ -176,6 +281,17 @@ class SimpleMaterial(Material):
             hashed ^= hash(self.specular.tobytes())
         if isinstance(self.glossiness, float):
             hashed ^= hash(int(self.glossiness * 1000))
+        # include the optional MTL fields so two materials that
+        # differ ONLY by Ni / d / Tf / illum don't hash equal and
+        # get collapsed into one exported `usemtl` material
+        if self.index_of_refraction is not None:
+            hashed ^= hash(("Ni", int(self.index_of_refraction * 1000)))
+        if self.dissolve is not None:
+            hashed ^= hash(("d", int(self.dissolve * 1000)))
+        if self.transmission_filter is not None:
+            hashed ^= hash(("Tf", tuple(int(v * 1000) for v in self.transmission_filter)))
+        if self.illumination_model is not None:
+            hashed ^= hash(("illum", int(self.illumination_model)))
         return hashed
 
     @property

@@ -348,7 +348,18 @@ def parse_mtl(mtl, resolver=None):
     lines = str.splitlines(str(mtl).strip())
 
     # remap OBJ property names to kwargs for SimpleMaterial
-    mapped = {"kd": "diffuse", "ka": "ambient", "ks": "specular", "ns": "glossiness"}
+    mapped = {
+        "kd": "diffuse",
+        "ka": "ambient",
+        "ks": "specular",
+        "ns": "glossiness",
+        # common scalar MTL properties forwarded as typed
+        # SimpleMaterial arguments so they survive export
+        "ni": "index_of_refraction",
+        "d": "dissolve",
+        "tf": "transmission_filter",
+        "illum": "illumination_model",
+    }
 
     for line in lines:
         # split by white space
@@ -398,6 +409,16 @@ def parse_mtl(mtl, resolver=None):
                     material[key] = value
             except BaseException:
                 log.debug("failed to convert color!", exc_info=True)
+        elif key == "tr" and material is not None:
+            # `Tr` is the inverse of `d` (transparency vs opacity):
+            # store the equivalent dissolve value. If `d` set
+            # dissolve first keep it as authoritative.
+            try:
+                tr = float(split[1])
+                material.setdefault("dissolve", 1.0 - tr)
+                material["tr"] = tr
+            except BaseException:
+                log.debug("failed to convert Tr", exc_info=True)
         # pass everything as kwargs to material constructor
         elif material is not None:
             # save any other unspecified keys
