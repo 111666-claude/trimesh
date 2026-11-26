@@ -46,7 +46,13 @@ except BaseException as E:
     nx = exceptions.ExceptionWrapper(E)
 
 
-def face_adjacency(faces=None, mesh=None, return_edges=False):
+def face_adjacency(
+    faces=None,
+    mesh=None,
+    return_edges=False,
+    non_manifold=False,
+    **kwargs,
+):
     """
     Returns an (n, 2) list of face indices.
     Each pair of faces in the list shares an edge, making them adjacent.
@@ -61,6 +67,18 @@ def face_adjacency(faces=None, mesh=None, return_edges=False):
         instead of generating from faces
     return_edges : bool
         Return the edges shared by adjacent faces
+    non_manifold : bool
+        If False (default) only edges used by exactly two edge
+        occurrences are considered, preserving the historical
+        manifold result and performance. If True every edge used by
+        at least two faces returns every unordered pair of distinct
+        faces sharing that edge, including non-manifold edges shared
+        by three or more faces. Self adjacency and duplicate face
+        pairs for a given edge are never returned.
+    **kwargs
+        Accepts the descriptive aliases ``include_non_manifold``,
+        ``allow_non_manifold`` and ``nonmanifold`` for
+        ``non_manifold``.
 
     Returns
     ----------
@@ -81,6 +99,27 @@ def face_adjacency(faces=None, mesh=None, return_edges=False):
     >>> groups = nx.connected_components(graph_connected)
     ```
     """
+    # allow a few descriptive aliases for the opt-in flag
+    non_manifold = bool(non_manifold)
+    for alias in (
+        "include_non_manifold",
+        "allow_non_manifold",
+        "nonmanifold",
+    ):
+        non_manifold = non_manifold or bool(kwargs.pop(alias, False))
+    if len(kwargs) > 0:
+        raise TypeError(
+            "face_adjacency() got unexpected keyword argument(s): "
+            + ", ".join(sorted(kwargs.keys()))
+        )
+
+    if non_manifold:
+        adjacency, adjacency_edges, _ = _face_adjacency_non_manifold(
+            faces=faces, mesh=mesh
+        )
+        if return_edges:
+            return adjacency, adjacency_edges
+        return adjacency
 
     if mesh is None:
         # first generate the list of edges for the current faces
@@ -122,6 +161,184 @@ def face_adjacency(faces=None, mesh=None, return_edges=False):
         return adjacency, adjacency_edges
 
     return adjacency
+
+
+def _face_adjacency_non_manifold(faces=None, mesh=None):
+    """
+    Core implementation returning the complete edge-wise face
+    adjacency including non-manifold edges.
+
+    For every unique edge used by at least two faces, every unordered
+    pair of *distinct* faces sharing that edge is returned exactly
+    once for that edge. Edges used by a single face produce no rows.
+    Each returned row stays aligned with its shared edge and with the
+    index of that edge in the unique edge ordering
+    (``mesh.edges_unique`` when a mesh is passed).
+
+    The common count-two edge groups are handled with the same fast
+    vectorized `grouping.group_rows` path as `face_adjacency`; only
+    the exceptional edge groups with more than two edge occurrences
+    are expanded individually.
+
+    Parameters
+    -----------
+    faces : (n, 3) int, or None
+        Vertex indices representing triangles
+    mesh : Trimesh object, or None
+        If passed will use cached edge values
+
+    Returns
+    ----------
+    adjacency : (p, 2) int64
+        Sorted distinct face index pairs
+    edges : (p, 2) int64
+        Sorted vertex edge shared by each pair, row-aligned
+    edge_index : (p,) int64
+        Index of the shared edge in the unique edge ordering
+    """
+    if mesh is None:
+        edges, edges_face = faces_to_edges(faces, return_index=True)
+        edges.sort(axis=1)
+        unique_idx, inverse = grouping.unique_rows(edges)
+        unique_edges = edges[unique_idx]
+    else:
+        # if passed a mesh, use the cached values
+        edges = mesh.edges_sorted
+        edges_face = mesh.edges_face
+        inverse = mesh.edges_unique_inverse
+        unique_edges = mesh.edges_unique
+
+    edges_face = np.asarray(edges_face, dtype=np.int64)
+    inverse = np.asarray(inverse, dtype=np.int64)
+    unique_edges = np.asarray(unique_edges, dtype=np.int64)
+
+    # Fast vectorized pass: edge groups with exactly two occurrences,
+    # identical to the default manifold code path.
+    edge_groups = grouping.group_rows(edges, require_count=2)
+    adjacency = np.asarray(edges_face[edge_groups], dtype=np.int64)
+
+    # degenerate faces may appear in adjacency as the same value
+    nondegenerate = adjacency[:, 0] != adjacency[:, 1]
+    edge_groups = edge_groups[nondegenerate]
+    adjacency = adjacency[nondegenerate]
+    adjacency.sort(axis=1)
+
+    pair_blocks = []
+    index_blocks = []
+    if len(adjacency) > 0:
+        pair_blocks.append(adjacency)
+        index_blocks.append(np.asarray(inverse[edge_groups[:, 0]], dtype=np.int64))
+
+    # One additional pass for edges with more than two occurrences.
+    counts = np.bincount(inverse, minlength=len(unique_edges))
+    long_edges = np.nonzero(counts > 2)[0]
+
+    if len(long_edges) > 0:
+        # group every edge occurrence by its unique-edge index once
+        occurrence_order = np.argsort(inverse, kind="stable")
+        offsets = np.concatenate(([0], np.cumsum(counts)))
+
+        for edge_id in long_edges:
+            start = int(offsets[edge_id])
+            stop = int(offsets[edge_id + 1])
+            occurrences = occurrence_order[start:stop]
+
+            # duplicate or degenerate triangles may contribute the same
+            # face more than once to one edge group: reduce to the
+            # sorted distinct face ids so no self or duplicate pair is
+            # ever emitted for this edge
+            face_ids = np.unique(edges_face[occurrences])
+            if face_ids.size < 2:
+                continue
+
+            # every unordered pair of distinct faces on this edge
+            i, j = np.triu_indices(face_ids.size, k=1)
+            pair_blocks.append(np.column_stack((face_ids[i], face_ids[j])))
+            index_blocks.append(np.full(len(i), edge_id, dtype=np.int64))
+
+    if len(pair_blocks) > 0:
+        adjacency = np.vstack(pair_blocks).astype(np.int64, copy=False)
+        edge_index = np.concatenate(index_blocks).astype(np.int64, copy=False)
+    else:
+        adjacency = np.zeros((0, 2), dtype=np.int64)
+        edge_index = np.zeros(0, dtype=np.int64)
+
+    # deterministic ordering by unique edge index; a stable sort keeps
+    # the within-edge pair order produced by triu_indices
+    if len(edge_index) > 1:
+        order = np.argsort(edge_index, kind="stable")
+        adjacency = adjacency[order]
+        edge_index = edge_index[order]
+
+    adjacency_edges = unique_edges[edge_index]
+    return adjacency, adjacency_edges, edge_index
+
+
+def face_adjacency_non_manifold(
+    faces=None,
+    mesh=None,
+    return_edges=False,
+    return_edge_indices=False,
+):
+    """
+    Returns every unordered pair of distinct faces sharing an edge,
+    including non-manifold edges shared by three or more faces.
+
+    Unlike `face_adjacency` with the default ``non_manifold=False``,
+    edges used by more than two faces are not discarded: an edge used
+    by ``k`` distinct faces yields all ``k * (k - 1) / 2`` face pairs.
+    Edges used by a single face yield no adjacency. For each edge no
+    self adjacency and no duplicate face pair is returned. Rows are
+    aligned with the shared edge and, if requested, the unique edge
+    index (``mesh.edges_unique`` with a mesh).
+
+    The same face pair may appear on multiple rows when two faces
+    share more than one edge (for example duplicate triangles); each
+    such row corresponds to a different shared edge / edge index.
+
+    Parameters
+    -----------
+    faces : (n, 3) int, or None
+        Vertex indices representing triangles
+    mesh : Trimesh object, or None
+        If passed will use cached edge values
+    return_edges : bool
+        Return the sorted vertex edge shared by each pair
+    return_edge_indices : bool
+        Return the unique edge index of each pair; this also returns
+        the shared edges as the middle array
+
+    Returns
+    ----------
+    adjacency : (p, 2) int
+        Sorted distinct face index pairs
+    edges : (p, 2) int
+        Only when ``return_edges`` or ``return_edge_indices`` is True:
+        sorted vertex edge shared by each pair
+    edge_index : (p,) int
+        Only when ``return_edge_indices`` is True: index into the
+        unique edge ordering / ``mesh.edges_unique``
+
+    Examples
+    ----------
+    Query the pairs on one shared edge:
+    ```python
+    adjacency, edges, edge_id = trimesh.graph.face_adjacency_non_manifold(
+        mesh=mesh, return_edge_indices=True
+    )
+    on_edge = adjacency[edge_id == some_edge_index]
+    ```
+    """
+    adjacency, edges, edge_index = _face_adjacency_non_manifold(faces=faces, mesh=mesh)
+    if return_edge_indices:
+        return adjacency, edges, edge_index
+    if return_edges:
+        return adjacency, edges
+    return adjacency
+
+
+# descriptive word-order alias
+non_manifold_face_adjacency = face_adjacency_non_manifold
 
 
 def face_neighborhood(mesh) -> NDArray[int64]:

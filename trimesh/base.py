@@ -1451,6 +1451,72 @@ class Trimesh(Geometry3D):
         return self._cache["face_adjacency_edges"]
 
     @cache_decorator
+    def face_adjacency_non_manifold(self) -> NDArray[int64]:
+        """
+        Find every pair of faces sharing an edge, including pairs on
+        non-manifold edges used by three or more faces.
+
+        Unlike `face_adjacency`, edge groups with more than two
+        incident faces are included as every unordered pair of distinct
+        faces on that edge. Rows are aligned with
+        `face_adjacency_non_manifold_edges` and
+        `face_adjacency_non_manifold_edge_index`.
+
+        Returns
+        ----------
+        adjacency : (p, 2) int
+          Pairs of distinct faces which share an edge
+        """
+        (
+            adjacency,
+            edges,
+            edge_index,
+        ) = graph.face_adjacency_non_manifold(mesh=self, return_edge_indices=True)
+        self._cache["face_adjacency_non_manifold_edges"] = edges
+        self._cache["face_adjacency_non_manifold_edge_index"] = edge_index
+        return adjacency
+
+    @cache_decorator
+    def face_adjacency_non_manifold_edges(self) -> NDArray[int64]:
+        """
+        Edges corresponding row-by-row to
+        `face_adjacency_non_manifold`.
+
+        Returns
+        ----------
+        edges : (p, 2) int
+           Sorted vertex indices of the shared edge for each pair
+        """
+        _ = self.face_adjacency_non_manifold
+        return self._cache["face_adjacency_non_manifold_edges"]
+
+    @cache_decorator
+    def face_adjacency_non_manifold_edge_index(self) -> NDArray[int64]:
+        """
+        Index into `edges_unique` for each row of
+        `face_adjacency_non_manifold`.
+
+        Returns
+        ----------
+        edge_index : (p,) int
+           Index of the shared edge in `edges_unique`
+        """
+        _ = self.face_adjacency_non_manifold
+        return self._cache["face_adjacency_non_manifold_edge_index"]
+
+    @cache_decorator
+    def non_manifold_face_adjacency(self) -> NDArray[int64]:
+        """
+        Word-order alias for `face_adjacency_non_manifold`.
+
+        Returns
+        ----------
+        adjacency : (p, 2) int
+          Pairs of distinct faces which share an edge
+        """
+        return self.face_adjacency_non_manifold
+
+    @cache_decorator
     def face_adjacency_edges_tree(self) -> cKDTree:
         """
         A KDTree for mapping edges back face adjacency index.
