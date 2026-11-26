@@ -372,6 +372,159 @@ class VoxelGridTest(g.unittest.TestCase):
         )
         assert octant.shape == (dim, dim, dim)
 
+    def test_union(self):
+        """
+        Test `VoxelGrid.union` and the `+` operator alias.
+        """
+        np = g.np
+        trimesh = g.trimesh
+
+        def grid(matrix, origin=(0, 0, 0), pitch=1.0, sparse=False):
+            matrix = np.asarray(matrix, dtype=bool)
+            if sparse:
+                from trimesh.voxel.encoding import SparseBinaryEncoding
+
+                indices = np.column_stack(np.where(matrix))
+                encoding = SparseBinaryEncoding(indices, shape=matrix.shape)
+            else:
+                encoding = matrix
+            return (
+                trimesh.voxel.VoxelGrid(encoding)
+                .apply_scale(pitch)
+                .apply_translation(origin)
+            )
+
+        def point_set(vox):
+            return {tuple(np.round(p, 8)) for p in vox.points}
+
+        # requirement 3: two grids occupying world (0, 0, 0) and
+        # (1, 0, 0) respectively, with different local origins
+        a = grid([[[True]]], origin=(0, 0, 0))
+        b = grid([[[True]]], origin=(1, 0, 0))
+        result = a.union(b)
+        expected_points = {(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)}
+        assert point_set(result) == expected_points
+        assert result.filled_count == 2
+        # transform, shape and occupied cells must be mutually consistent
+        assert result.shape == (2, 1, 1)
+        np.testing.assert_allclose(result.translation, (0, 0, 0))
+        assert np.all(result.is_filled(np.array(list(expected_points))))
+        # `+` is an alias for union
+        assert point_set(a + b) == expected_points
+
+        # overlapping cells are only occupied once
+        overlap = grid([[[True, True]]], origin=(0, 0, 0)).union(
+            grid([[[True]]], origin=(0, 0, 1))
+        )
+        assert overlap.filled_count == 2
+        assert point_set(overlap) == {(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)}
+        # identical grids union to an equivalent grid
+        same = a.union(a)
+        assert same.filled_count == 1
+        assert point_set(same) == {(0.0, 0.0, 0.0)}
+
+        # negative direction offsets
+        neg = grid([[[True]]], origin=(0, 0, 0)).union(
+            grid([[[True]]], origin=(-1, -2, -3))
+        )
+        assert neg.filled_count == 2
+        assert point_set(neg) == {(0.0, 0.0, 0.0), (-1.0, -2.0, -3.0)}
+        assert neg.shape == (2, 3, 4)
+        np.testing.assert_allclose(neg.translation, (-1.0, -2.0, -3.0))
+
+        # completely disjoint inputs
+        far = a.union(grid([[[True]], [[True]]], origin=(10, 0, 0)))
+        assert far.filled_count == 3
+        assert point_set(far) == {
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            (11.0, 0.0, 0.0),
+        }
+        assert far.shape == (12, 1, 1)
+
+        # empty grids on either side, including both empty
+        empty = grid(np.zeros((2, 2, 2), dtype=bool))
+        assert empty.union(a).filled_count == 1
+        assert point_set(empty.union(a)) == {(0.0, 0.0, 0.0)}
+        assert point_set(a.union(empty)) == {(0.0, 0.0, 0.0)}
+        both_empty = empty.union(grid(np.zeros((3, 1, 1), dtype=bool)))
+        assert both_empty.is_empty
+        assert both_empty.filled_count == 0
+
+        # inputs must remain unchanged
+        a_matrix = a.encoding.dense.copy()
+        b_matrix = b.encoding.dense.copy()
+        a_origin = a.translation.copy()
+        b_origin = b.translation.copy()
+        _ = a.union(b)
+        np.testing.assert_array_equal(a.encoding.dense, a_matrix)
+        np.testing.assert_array_equal(b.encoding.dense, b_matrix)
+        np.testing.assert_allclose(a.translation, a_origin)
+        np.testing.assert_allclose(b.translation, b_origin)
+
+        # union is commutative: same world points, consistent encoding
+        forward = a.union(b)
+        backward = b.union(a)
+        assert point_set(forward) == point_set(backward)
+        assert forward.filled_count == backward.filled_count
+        np.testing.assert_array_equal(forward.encoding.dense, backward.encoding.dense)
+
+        # non-unit pitch, still integer-cell offset
+        pitched = grid([[[True]]], origin=(0, 0, 0), pitch=0.5).union(
+            grid([[[True]]], origin=(1.0, 0.0, 0.0), pitch=0.5)
+        )
+        assert pitched.filled_count == 2
+        assert point_set(pitched) == {(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)}
+        np.testing.assert_allclose(pitched.pitch, 0.5)
+        np.testing.assert_allclose(pitched.translation, (0.0, 0.0, 0.0))
+
+        # sparse + dense and sparse + sparse inputs work too
+        dense = grid([[[True]], [[True]]], origin=(0, 0, 0))
+        sparse = grid([[[True]]], origin=(1, 0, 0), sparse=True)
+        mixed = dense.union(sparse)
+        assert mixed.filled_count == 2
+        assert point_set(mixed) == {(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)}
+        both_sparse = grid([[[True]], [[True]]], origin=(0, 0, 0), sparse=True).union(
+            grid([[[True]]], origin=(1, 0, 0), sparse=True)
+        )
+        assert both_sparse.filled_count == 2
+        assert point_set(both_sparse) == {(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)}
+
+        # the result's points are exactly the union of input points
+        rng = np.random.default_rng(0)
+        m0 = rng.random((4, 4, 4)) > 0.6
+        m1 = rng.random((4, 4, 4)) > 0.6
+        u = grid(m0, origin=(0, 0, 0), pitch=0.25).union(
+            grid(m1, origin=(0.25, 0.0, -0.25), pitch=0.25)
+        )
+        expected = point_set(grid(m0, origin=(0, 0, 0), pitch=0.25)) | point_set(
+            grid(m1, origin=(0.25, 0.0, -0.25), pitch=0.25)
+        )
+        assert point_set(u) == expected
+        assert u.filled_count == len(expected)
+        # every reported point is filled and maps back through the transform
+        assert np.all(u.is_filled(u.points))
+        roundtrip = u.indices_to_points(u.points_to_indices(u.points))
+        np.testing.assert_allclose(roundtrip, u.points, atol=1e-10)
+
+        # mismatched pitch is explicitly rejected
+        with self.assertRaises(ValueError):
+            a.union(grid([[[True]]], pitch=0.5))
+
+        # non-integer cell offset is explicitly rejected
+        with self.assertRaises(ValueError):
+            a.union(grid([[[True]]], origin=(0.3, 0.0, 0.0)))
+
+        # rotated grids are explicitly rejected
+        rotated = grid([[[True]]])
+        rotated.apply_transform(trimesh.transformations.rotation_matrix(0.3, [0, 0, 1]))
+        with self.assertRaises(ValueError):
+            a.union(rotated)
+
+        # non-VoxelGrid operands raise TypeError through `+`
+        with self.assertRaises(TypeError):
+            a + 5
+
     def test_transform_cache(self):
         encoding = [
             [[0, 0, 0], [0, 1, 0], [0, 0, 0]],

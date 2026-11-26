@@ -14,7 +14,7 @@ from ..constants import log
 from ..exchange.binvox import export_binvox
 from ..parent import Geometry
 from . import morphology, ops, transforms
-from .encoding import DenseEncoding, Encoding
+from .encoding import DenseEncoding, Encoding, SparseBinaryEncoding
 
 
 class VoxelGrid(Geometry):
@@ -417,5 +417,103 @@ class VoxelGrid(Geometry):
         translate = bounds[0]
         return VoxelGrid(dense, transform=tr.scale_and_translate(scale, translate))
 
+    def union(self, other):
+        """
+        Return the union of this voxel grid with another.
+
+        The grids must be axis-aligned, share the same uniform pitch and
+        have origins that differ by an integer number of voxel cells, i.e.
+        their lattices must be coincident in world space. Occupied cells at
+        the same world location are merged so they are only counted once.
+
+        Neither input grid is modified.
+
+        Parameters
+        ----------
+        other : trimesh.voxel.VoxelGrid
+          The voxel grid to union with this one.
+
+        Returns
+        ----------
+        union : trimesh.voxel.VoxelGrid
+          A new grid whose occupied cells are the union of the two inputs.
+          Its transform places index ``[0, 0, 0]`` at the minimum occupied
+          lattice corner, its shape spans every occupied cell and its
+          occupied points match those of the inputs in world coordinates.
+
+        Raises
+        ----------
+        ValueError
+          If `other` is not a `VoxelGrid`, if either grid is rotated or
+          sheared, if their pitches differ, or if their origins are not
+          separated by an integer number of cells.
+        """
+        if not isinstance(other, VoxelGrid):
+            raise ValueError(f"union requires a VoxelGrid, got {type(other).__name__}")
+
+        def _axis_aligned(matrix):
+            # the linear part must be a diagonal (no rotation/shear),
+            # positive (no reflection) scaling matrix
+            linear = matrix[:3, :3]
+            diagonal = np.diag(linear)
+            if not np.allclose(
+                linear, diagonal * np.eye(3), np.abs(diagonal) * 1e-6 + 1e-8
+            ) or np.any(diagonal <= 0.0):
+                raise ValueError(
+                    "union requires axis-aligned grids (no rotation or shear)"
+                )
+            return diagonal
+
+        pitch_self = _axis_aligned(self.transform)
+        pitch_other = _axis_aligned(other.transform)
+        if not np.allclose(
+            pitch_self, pitch_other, np.max(np.abs(pitch_self)) * 1e-6 + 1e-8
+        ):
+            raise ValueError(f"grid pitches differ: {pitch_self} vs {pitch_other}")
+        pitch = pitch_self
+
+        # translation of each grid's [0, 0, 0] cell in world coordinates
+        origin_self = self.transform[:3, 3]
+        origin_other = other.transform[:3, 3]
+        # offset of `other` relative to self, measured in voxel cells
+        offset = (origin_other - origin_self) / pitch
+        offset_int = np.round(offset).astype(int)
+        if not np.allclose(offset, offset_int, atol=1e-6, rtol=0.0):
+            raise ValueError(f"origins must differ by integer cells, got {offset}")
+
+        # empty grids contribute nothing: return a copy so the inputs
+        # are never mutated or referenced by the returned grid
+        if self.is_empty:
+            return other.copy()
+        if other.is_empty:
+            return self.copy()
+
+        # express every occupied cell in a shared lattice whose origin
+        # is the minimum occupied cell corner in world coordinates
+        indices_self = self.sparse_indices
+        indices_other = other.sparse_indices + offset_int
+        merged = np.vstack((indices_self, indices_other))
+        minimum = merged.min(axis=0)
+        merged -= minimum
+
+        # drop duplicate cells so overlapping voxels count once
+        merged = np.unique(merged, axis=0)
+        shape = tuple((merged.max(axis=0) + 1).tolist())
+
+        if isinstance(self.encoding, DenseEncoding) and isinstance(
+            other.encoding, DenseEncoding
+        ):
+            dense = np.zeros(shape, dtype=bool)
+            dense[tuple(merged.T)] = True
+            encoding = DenseEncoding(dense)
+        else:
+            encoding = SparseBinaryEncoding(merged, shape=shape)
+
+        origin = origin_self + minimum * pitch
+        transform = tr.scale_and_translate(scale=pitch, translate=origin)
+        return VoxelGrid(encoding, transform=transform)
+
     def __add__(self, other):
-        raise NotImplementedError("TODO : implement voxel concatenation")
+        if not isinstance(other, VoxelGrid):
+            return NotImplemented
+        return self.union(other)
