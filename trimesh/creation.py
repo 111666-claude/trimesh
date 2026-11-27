@@ -249,6 +249,53 @@ def extrude_polygon(
     return mesh
 
 
+def _minimal_rotation(a: NDArray, b: NDArray) -> NDArray:
+    """
+    Get the `(3, 3)` rotation matrix taking unit vector `a` to
+    unit vector `b` with the smallest possible rotation angle,
+    i.e. a parallel transport with no added twist.
+
+    Parameters
+    ----------
+    a : (3,) float
+      Unit vector to rotate from.
+    b : (3,) float
+      Unit vector to rotate to.
+
+    Returns
+    -------
+    matrix : (3, 3) float
+      Rotation matrix such that `matrix @ a == b`.
+    """
+    axis = np.cross(a, b)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-12:
+        if np.dot(a, b) > 0.0:
+            # vectors are already aligned
+            return np.eye(3)
+        # vectors are antiparallel: rotate 180 degrees about
+        # any axis perpendicular to `a`
+        axis = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(axis) < 1e-12:
+            axis = np.cross(a, [0.0, 1.0, 0.0])
+        axis /= np.linalg.norm(axis)
+        # Rodrigues' formula for a 180 degree rotation
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+    axis /= norm
+    angle = np.arctan2(norm, np.dot(a, b))
+    # Rodrigues' rotation formula
+    x, y, z = axis
+    cos, sin = np.cos(angle), np.sin(angle)
+    C = 1.0 - cos
+    return np.array(
+        [
+            [x * x * C + cos, x * y * C - z * sin, x * z * C + y * sin],
+            [y * x * C + z * sin, y * y * C + cos, y * z * C - x * sin],
+            [z * x * C - y * sin, z * y * C + x * sin, z * z * C + cos],
+        ]
+    )
+
+
 def sweep_polygon(
     polygon: "Polygon",
     path: ArrayLike,
@@ -264,6 +311,11 @@ def sweep_polygon(
     the polygon to intersect the plane of a previous slice, and does *not*
     scale the polygon along the induced normal to result in a constant cross section.
 
+    The cross-section orientation is parallel transported along the
+    path (a rotation-minimizing frame) so adjacent slices don't
+    accumulate unexpected twist or flip suddenly based on world
+    coordinate directions.
+
     You may want to resample your path with a B-spline, i.e:
       `trimesh.path.simplify.resample_spline(path, smooth=0.2, count=100)`
 
@@ -274,8 +326,9 @@ def sweep_polygon(
     path : (n, 3) float
       A path in 3D
     angles : (n,) float
-      Optional rotation angle relative to prior vertex
-      at each vertex.
+      Optional rotation of the cross section about the path
+      tangent at each vertex, applied relative to the
+      parallel-transported orientation.
     cap
       If an open path is passed apply a cap to both ends.
     connect
@@ -332,9 +385,32 @@ def sweep_polygon(
     # - the second plane will be the average of the two vectors
     # - the last plane will be exactly along the last vector
     # and each plane origin will be the corresponding vertex on the path
-    vector = util.unitize(path[1:] - path[:-1])
+    vector = path[1:] - path[:-1]
+    # explicitly handle degenerate (zero-length) segments from
+    # adjacent duplicate points by borrowing the direction of
+    # the nearest non-degenerate segment
+    vector_norm = np.linalg.norm(vector, axis=1)
+    if (vector_norm <= tol.merge).any():
+        valid = vector_norm > tol.merge
+        if not valid.any():
+            raise ValueError("path contains no non-degenerate segments!")
+        index = np.arange(len(vector))
+        # index of the last valid segment at or before each segment
+        forward = np.where(valid, index, 0)
+        np.maximum.accumulate(forward, out=forward)
+        # index of the first valid segment at or after each segment
+        backward = np.where(valid, index, len(vector) - 1)
+        np.minimum.accumulate(backward[::-1], out=backward[::-1])
+        # use whichever valid segment is closer
+        vector = vector[np.where(index - forward <= backward - index, forward, backward)]
+    vector = util.unitize(vector)
     # unitize instead of / 2 as they may be degenerate / zero
-    vector_mean = util.unitize(vector[1:] + vector[:-1])
+    vector_mean = vector[1:] + vector[:-1]
+    mean_norm = np.linalg.norm(vector_mean, axis=1)
+    # a near-180 degree turn makes the mean degenerate: fall
+    # back to the incoming segment direction for those slices
+    vector_mean[mean_norm <= tol.merge] = vector[1:][mean_norm <= tol.merge]
+    vector_mean = util.unitize(vector_mean)
     # collect the vectors into plane normals
     normal = np.concatenate([[vector[0]], vector_mean, [vector[-1]]], axis=0)
 
@@ -345,49 +421,55 @@ def sweep_polygon(
     # planes should have one unit normal and one vertex each
     assert normal.shape == path.shape
 
-    # get the spherical coordinates for the normal vectors
-    theta, phi = util.vector_to_spherical(normal).T
-
-    # collect the trig values into numpy arrays we can compose into matrices
+    # build a rotation-minimizing frame for each slice by parallel
+    # transporting an initial frame along the path: this keeps the
+    # cross-section orientation continuous and low-twist rather than
+    # depending on world-coordinate directions which can flip suddenly
+    frames = np.zeros((len(path), 3, 3), dtype=np.float64)
+    # the initial frame uses the historical spherical-coordinate
+    # construction so straight paths produce identical results
+    theta, phi = util.vector_to_spherical(normal[:1])[0]
     cos_theta, sin_theta = np.cos(theta), np.sin(theta)
     cos_phi, sin_phi = np.cos(phi), np.sin(phi)
-    cos_roll, sin_roll = np.cos(angles), np.sin(angles)
+    frames[0] = [
+        [sin_theta, cos_phi * cos_theta, sin_phi * cos_theta],
+        [-cos_theta, sin_theta * cos_phi, sin_phi * sin_theta],
+        [0.0, -sin_phi, cos_phi],
+    ]
+    # transport the frame along the path with the minimal rotation
+    # taking each normal to the next
+    for i in range(1, len(frames)):
+        frames[i] = _minimal_rotation(normal[i - 1], normal[i]).dot(frames[i - 1])
 
-    # we want a rotation which will be the identity for a Z+ vector
-    # this was constructed and unrolled from the following sympy block
-    # theta, phi, roll = sp.symbols("theta phi roll")
-    # matrix = (
-    #     tf.rotation_matrix(roll, [0, 0, 1]) @
-    #     tf.rotation_matrix(phi, [1, 0, 0]) @
-    #     tf.rotation_matrix((sp.pi / 2) - theta, [0, 0, 1])
-    # ).inv()
-    # matrix.simplify()
+    # the historical construction applied `angles` as a rotation
+    # about the local Z axis with a negated sign: keep that
+    # convention so explicit angles mean the same per-point rotation
+    roll = -angles
+    if closed and connect:
+        # transport the frame around the loop back to the start
+        returned = _minimal_rotation(normal[-1], normal[0]).dot(frames[-1])
+        # the transported frame may be twisted relative to the initial
+        # frame: distribute that twist evenly along the loop so the
+        # seam of a closed path connects cleanly
+        twist = np.arctan2(
+            np.dot(returned[:, 0], frames[0][:, 1]),
+            np.dot(returned[:, 0], frames[0][:, 0]),
+        )
+        roll = roll - twist * np.linspace(0.0, 1.0, len(path))
 
-    # shorthand for stacking
-    zeros = np.zeros(len(theta))
-    ones = np.ones(len(theta))
+    # apply the roll as a rotation about each slice's local Z axis
+    cos_roll, sin_roll = np.cos(roll), np.sin(roll)
+    rot_z = np.zeros((len(path), 3, 3), dtype=np.float64)
+    rot_z[:, 0, 0] = cos_roll
+    rot_z[:, 0, 1] = -sin_roll
+    rot_z[:, 1, 0] = sin_roll
+    rot_z[:, 1, 1] = cos_roll
+    rot_z[:, 2, 2] = 1.0
 
-    # stack initially as one unrolled matrix per row
-    transforms = np.column_stack(
-        [
-            -sin_roll * cos_phi * cos_theta + sin_theta * cos_roll,
-            sin_roll * sin_theta + cos_phi * cos_roll * cos_theta,
-            sin_phi * cos_theta,
-            path[:, 0],
-            -sin_roll * sin_theta * cos_phi - cos_roll * cos_theta,
-            -sin_roll * cos_theta + sin_theta * cos_phi * cos_roll,
-            sin_phi * sin_theta,
-            path[:, 1],
-            sin_phi * sin_roll,
-            -sin_phi * cos_roll,
-            cos_phi,
-            path[:, 2],
-            zeros,
-            zeros,
-            zeros,
-            ones,
-        ]
-    ).reshape((-1, 4, 4))
+    # collect the frames into homogeneous transforms
+    transforms = np.tile(np.eye(4), (len(path), 1, 1))
+    transforms[:, :3, :3] = np.matmul(frames, rot_z)
+    transforms[:, :3, 3] = path
 
     if tol.strict:
         # make sure that each transform moves the Z+ vector to the requested normal
