@@ -28,6 +28,13 @@ def _read_mesh(mesh):
       Vertices
     face_array : (n, 3) int64
       Indexes of vertices forming triangles.
+    face_pid : (n,) int64
+      Per-triangle property group (`pid`) override: `0` means the
+      triangle does not override the object default, positive values
+      are resource ids and `-1` marks an unparsable explicit id.
+    face_pindex : (n,) int64
+      Per-triangle property index (`p1`, falling back to `p2`/`p3`),
+      `-1` when unspecified.
     """
     # get the XML elements for vertices and faces
     vertices = mesh.find("{*}vertices")
@@ -46,16 +53,206 @@ def _read_mesh(mesh):
     # convert every value to floating point in one-shot rather than in a loop
     v_array = np.fromstring(vs, dtype=np.float64, sep=" ").reshape((-1, 3))
 
-    # do the same behavior for faces but as an integer
-    fs = " ".join(
-        [
-            f"{i.attrib['v1']} {i.attrib['v2']} {i.attrib['v3']}"
-            for i in faces.iter("{*}triangle")
-        ]
-    )
-    f_array = np.fromstring(fs, dtype=np.int64, sep=" ").reshape((-1, 3))
+    # do the same behavior for faces but as an integer, collecting the
+    # optional `pid`/`p1` material overrides in the same pass
+    face_tokens = []
+    face_pid = []
+    face_pindex = []
+    for tri in faces.iter("{*}triangle"):
+        attrib = tri.attrib
+        face_tokens.append(f"{attrib['v1']} {attrib['v2']} {attrib['v3']}")
 
-    return v_array, f_array
+        pid = attrib.get("pid")
+        if pid is None:
+            face_pid.append(0)
+        else:
+            try:
+                face_pid.append(int(pid))
+            except (TypeError, ValueError):
+                # explicit but not a valid resource id: never resolve
+                face_pid.append(-1)
+
+        # for base materials p1 == p2 == p3 so p1 is the face index
+        index = attrib.get("p1", attrib.get("p2", attrib.get("p3")))
+        try:
+            face_pindex.append(int(index) if index is not None else -1)
+        except (TypeError, ValueError):
+            face_pindex.append(-1)
+
+    f_array = np.fromstring(" ".join(face_tokens), dtype=np.int64, sep=" ").reshape(
+        (-1, 3)
+    )
+
+    return (
+        v_array,
+        f_array,
+        np.asarray(face_pid, dtype=np.int64),
+        np.asarray(face_pindex, dtype=np.int64),
+    )
+
+
+def _parse_display_color(value):
+    """
+    Parse a 3MF `displaycolor` (`#RRGGBB` or `#RRGGBBAA`) value.
+
+    Parameters
+    ----------
+    value : str or None
+      Hex encoded sRGB color, alpha is the final byte and defaults to 255.
+
+    Returns
+    ----------
+    rgba : (4,) uint8 or None
+      Parsed color, or `None` if the value is missing/malformed.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lstrip("#")
+    try:
+        if len(text) == 6:
+            rgba = [int(text[i : i + 2], 16) for i in (0, 2, 4)] + [255]
+        elif len(text) == 8:
+            rgba = [int(text[i : i + 2], 16) for i in (0, 2, 4, 6)]
+        else:
+            return None
+    except ValueError:
+        return None
+    return np.asarray(rgba, dtype=np.uint8)
+
+
+def _format_display_color(color):
+    """
+    Encode an RGBA color as a 3MF `displaycolor`, using the compact
+    `#RRGGBB` form for opaque colors and `#RRGGBBAA` otherwise.
+    """
+    r, g, b, a = (int(c) for c in color)
+    if a >= 255:
+        return f"#{r:02X}{g:02X}{b:02X}"
+    return f"#{r:02X}{g:02X}{b:02X}{a:02X}"
+
+
+def _face_color_palette(mesh):
+    """
+    Collect the unique face colors of a mesh for base-material export.
+
+    Returns
+    ----------
+    palette : (k, 4) uint8 or None
+      Unique colors, or `None` if the mesh has no explicit face colors.
+    inverse : (len(mesh.faces),) int64 or None
+      Index into `palette` for every face.
+    """
+    visual = getattr(mesh, "visual", None)
+    if visual is None or getattr(visual, "kind", None) != "face":
+        return None, None
+
+    face_colors = np.asarray(visual.face_colors, dtype=np.uint8)
+    if face_colors.ndim != 2 or face_colors.shape[1] != 4:
+        return None, None
+    if len(face_colors) != len(mesh.faces) or len(face_colors) == 0:
+        return None, None
+
+    palette, first, sorted_inverse = np.unique(
+        face_colors, axis=0, return_index=True, return_inverse=True
+    )
+    # order the palette by first face occurrence rather than byte order
+    order = np.argsort(first)
+    palette = palette[order].astype(np.uint8)
+    remap = np.zeros(len(order), dtype=np.int64)
+    remap[order] = np.arange(len(order), dtype=np.int64)
+    inverse = remap[sorted_inverse].astype(np.int64)
+    return palette, inverse
+
+
+def _resolve_face_colors(
+    count,
+    face_pid,
+    face_pindex,
+    default_pid,
+    default_pindex,
+    material_groups,
+    label="",
+):
+    """
+    Resolve 3MF base-material references to one RGBA color per face.
+
+    Parameters
+    ----------
+    count : int
+      Number of faces.
+    face_pid : (count,) int64
+      Per-triangle pid override from `_read_mesh`.
+    face_pindex : (count,) int64
+      Per-triangle property index override.
+    default_pid : int or None
+      Object-level default material resource id.
+    default_pindex : int
+      Object-level default property index (`-1` if unspecified).
+    material_groups : dict
+      `{resource id int : (k, 4) uint8 palette}` for `<basematerials>`.
+    label : str
+      Object id/name used in warning messages.
+
+    Returns
+    ----------
+    colors : (count, 4) uint8 or None
+      One color per face (unresolved faces use the trimesh default),
+      or `None` when no face referenced a resolvable base material.
+    """
+    from ..visual.color import DEFAULT_COLOR
+
+    colors = np.tile(DEFAULT_COLOR, (count, 1)).astype(np.uint8)
+    if count == 0:
+        return None
+
+    # effective resource group and index per face: triangle attributes
+    # override the object-level pid/pindex defaults
+    object_pid = int(default_pid) if default_pid is not None else 0
+    object_index = int(default_pindex) if default_pindex is not None else -1
+
+    effective_pid = np.where(face_pid != 0, face_pid, object_pid)
+    effective_index = np.where(face_pindex >= 0, face_pindex, object_index)
+
+    resolved_any = False
+    for gid in np.unique(effective_pid):
+        gid = int(gid)
+        if gid <= 0:
+            # gid == 0: no material specified; gid < 0: malformed pid
+            if gid < 0:
+                log.warning(
+                    "3MF object %s has a triangle with an invalid pid; leaving that face with the default color",
+                    label,
+                )
+            continue
+
+        mask = effective_pid == gid
+        palette = material_groups.get(gid)
+        if palette is None:
+            log.warning(
+                "3MF object %s references material resource id %s which is not defined as a <basematerials> group; leaving %d face(s) with the default color",
+                label,
+                gid,
+                int(mask.sum()),
+            )
+            continue
+
+        indices = effective_index[mask]
+        valid = (indices >= 0) & (indices < len(palette))
+        if not valid.all():
+            log.warning(
+                "3MF object %s uses an out-of-range material index into resource %s (group has %d entries); leaving %d face(s) with the default color",
+                label,
+                gid,
+                len(palette),
+                int((~valid).sum()),
+            )
+
+        positions = np.flatnonzero(mask)
+        if valid.any():
+            colors[positions[valid]] = palette[indices[valid]]
+            resolved_any = True
+
+    return colors if resolved_any else None
 
 
 def load_3MF(file_obj, postprocess=True, **kwargs):
@@ -102,6 +299,14 @@ def load_3MF(file_obj, postprocess=True, **kwargs):
     # each instance is a single geometry
     build_items = []
 
+    # base material resources: {resource id : (k, 4) uint8 palette}
+    material_groups = {}
+    # object-level default material: {object id : (pid int|None, pindex int)}
+    object_materials = {}
+    # per object, per mesh part triangle overrides
+    # {mesh id : [(pid array, pindex array), ...]}
+    material_refs = defaultdict(list)
+
     # keep track of names we can use
     consumed_counts = {}
     consumed_names = set()
@@ -110,12 +315,55 @@ def load_3MF(file_obj, postprocess=True, **kwargs):
     # loaded elements are cleared to avoid ballooning memory
     model.seek(0)
     for _, obj in etree.iterparse(
-        model, tag=("{*}object", "{*}build"), events=("end",), **XML_PARSER_OPTIONS
+        model,
+        tag=("{*}object", "{*}build", "{*}basematerials"),
+        events=("end",),
+        **XML_PARSER_OPTIONS,
     ):
+        # parse base material resource groups
+        if "basematerials" in obj.tag:
+            gid = obj.attrib.get("id")
+            try:
+                gid = int(gid)
+            except (TypeError, ValueError):
+                log.warning("3MF <basematerials> missing valid id: %s", gid)
+                continue
+
+            palette = []
+            for base in obj.iter("{*}base"):
+                rgba = _parse_display_color(base.attrib.get("displaycolor"))
+                if rgba is None:
+                    log.warning(
+                        "3MF basematerials %s contains an invalid displaycolor %r; using the default color",
+                        gid,
+                        base.attrib.get("displaycolor"),
+                    )
+                    from ..visual.color import DEFAULT_COLOR
+
+                    rgba = DEFAULT_COLOR
+                palette.append(rgba)
+            material_groups[gid] = (
+                np.asarray(palette, dtype=np.uint8).reshape((-1, 4))
+                if len(palette) > 0
+                else np.zeros((0, 4), dtype=np.uint8)
+            )
+
         # parse objects
         if "object" in obj.tag:
             # id is mandatory
             index = obj.attrib["id"]
+
+            # object-level default base material (pid + pindex)
+            default_pid = obj.attrib.get("pid")
+            try:
+                default_pid = int(default_pid) if default_pid is not None else None
+            except (TypeError, ValueError):
+                default_pid = None
+            try:
+                default_pindex = int(obj.attrib.get("pindex"))
+            except (TypeError, ValueError):
+                default_pindex = -1
+            object_materials[index] = (default_pid, default_pindex)
 
             # start with stored name
             # apparently some exporters name multiple meshes
@@ -129,9 +377,10 @@ def load_3MF(file_obj, postprocess=True, **kwargs):
 
             # if the object has actual geometry data parse here
             for mesh in obj.iter("{*}mesh"):
-                v, f = _read_mesh(mesh)
+                v, f, f_pid, f_pindex = _read_mesh(mesh)
                 v_seq[index].append(v)
                 f_seq[index].append(f)
+                material_refs[index].append((f_pid, f_pindex))
 
             # components are references to other geometries
             for c in obj.iter("{*}component"):
@@ -161,9 +410,10 @@ def load_3MF(file_obj, postprocess=True, **kwargs):
                         events=("end",),
                         **XML_PARSER_OPTIONS,
                     ):
-                        v, f = _read_mesh(m)
+                        v, f, f_pid, f_pindex = _read_mesh(m)
                         v_seq[mesh_index].append(v)
                         f_seq[mesh_index].append(f)
+                        material_refs[mesh_index].append((f_pid, f_pindex))
 
         # parse build
         if "build" in obj.tag:
@@ -181,11 +431,38 @@ def load_3MF(file_obj, postprocess=True, **kwargs):
     for gid in v_seq.keys():
         v, f = util.append_faces(v_seq[gid], f_seq[gid])
         name = id_name[gid]
-        meshes[name] = {
+        mesh_kwargs = {
             "vertices": v,
             "faces": f,
             "metadata": metadata.copy(),
         }
+
+        # resolve core-spec base materials into one color per face
+        refs = material_refs.get(gid)
+        if refs:
+            ref_pid = np.concatenate([pid for pid, _ in refs])
+            ref_pindex = np.concatenate([pindex for _, pindex in refs])
+            if len(ref_pid) != len(f):
+                # should not happen, but never let malformed input
+                # misalign colors with faces
+                log.warning("3MF material references did not align with faces")
+                ref_pid = np.zeros(len(f), dtype=np.int64)
+                ref_pindex = np.full(len(f), -1, dtype=np.int64)
+
+            default_pid, default_pindex = object_materials.get(gid, (None, -1))
+            face_colors = _resolve_face_colors(
+                count=len(f),
+                face_pid=ref_pid,
+                face_pindex=ref_pindex,
+                default_pid=default_pid,
+                default_pindex=default_pindex,
+                material_groups=material_groups,
+                label=str(gid),
+            )
+            if face_colors is not None:
+                mesh_kwargs["face_colors"] = face_colors
+
+        meshes[name] = mesh_kwargs
         # apply any keyword arguments that aren't None
         meshes[name].update({k: v for k, v in kwargs.items() if v is not None})
 
@@ -359,8 +636,39 @@ def export_3MF(mesh, batch_size=4096, compression=zipfile.ZIP_DEFLATED, compress
             with xf.element("model", {"unit": "millimeter"}, nsmap=model_nsmap):
                 # objects with mesh data and/or references to other objects
                 with xf.element("resources"):
+                    # resolve face-color palettes up front: CT_Resources
+                    # requires every property group to be written before
+                    # the <object> elements
+                    material_info = {}
+                    for name, m in geometry.items():
+                        palette, inverse = _face_color_palette(m)
+                        if palette is not None:
+                            material_info[name] = (
+                                palette,
+                                inverse,
+                                model_id(("basematerials", name)),
+                            )
+
+                    # write one core-spec <basematerials> group per colored mesh
+                    for palette, _inverse, material_id in material_info.values():
+                        with xf.element("basematerials", {"id": material_id}):
+                            xf.flush()
+                            for start in range(0, len(palette), batch_size):
+                                chunk = palette[start : start + batch_size]
+                                bases = "".join(
+                                    f'<base name="color_{start + j}" displaycolor="{_format_display_color(color)}" />'
+                                    for j, color in enumerate(chunk)
+                                )
+                                f.write(bases.encode("utf-8"))
+
                     # stream objects with actual mesh data
-                    for i, (name, m) in enumerate(geometry.items()):
+                    for name, m in geometry.items():
+                        info = material_info.get(name)
+                        if info is not None:
+                            palette, inverse, material_id = info
+                        else:
+                            palette = inverse = material_id = None
+
                         # attributes for object
                         attribs = {
                             "id": model_id(name),
@@ -368,14 +676,20 @@ def export_3MF(mesh, batch_size=4096, compression=zipfile.ZIP_DEFLATED, compress
                             "type": "model",
                             "p:UUID": str(uuid.uuid4()),
                         }
+                        if material_id is not None:
+                            # object-wide default material: uniform color
+                            # for single-palette meshes, index zero otherwise
+                            attribs["pid"] = material_id
+                            attribs["pindex"] = "0"
+
                         with xf.element("object", **attribs):
                             with xf.element("mesh"):
                                 with xf.element("vertices"):
                                     # vertex nodes are written directly to the file
                                     # so make sure lxml's buffer is flushed
                                     xf.flush()
-                                    for i in range(0, len(m.vertices), batch_size):
-                                        batch = m.vertices[i : i + batch_size]
+                                    for start in range(0, len(m.vertices), batch_size):
+                                        batch = m.vertices[start : start + batch_size]
                                         fragment = (
                                             '<vertex x="{}" y="{}" z="{}" />' * len(batch)
                                         )
@@ -386,17 +700,29 @@ def export_3MF(mesh, batch_size=4096, compression=zipfile.ZIP_DEFLATED, compress
                                         )
                                 with xf.element("triangles"):
                                     xf.flush()
-                                    for i in range(0, len(m.faces), batch_size):
-                                        batch = m.faces[i : i + batch_size]
-                                        fragment = (
-                                            '<triangle v1="{}" v2="{}" v3="{}" />'
-                                            * len(batch)
-                                        )
-                                        f.write(
-                                            fragment.format(*batch.flatten()).encode(
-                                                "utf-8"
+                                    # more than one unique color means each
+                                    # triangle references its palette entry
+                                    per_face = (
+                                        material_id is not None and len(palette) > 1
+                                    )
+                                    for start in range(0, len(m.faces), batch_size):
+                                        batch = m.faces[start : start + batch_size]
+                                        if per_face:
+                                            indices = inverse[start : start + batch_size]
+                                            fragment = (
+                                                f'<triangle v1="{{}}" v2="{{}}" v3="{{}}" pid="{material_id}" p1="{{}}" />'
+                                                * len(batch)
                                             )
-                                        )
+                                            values = np.column_stack(
+                                                (batch, indices)
+                                            ).flatten()
+                                        else:
+                                            fragment = (
+                                                '<triangle v1="{}" v2="{}" v3="{}" />'
+                                                * len(batch)
+                                            )
+                                            values = batch.flatten()
+                                        f.write(fragment.format(*values).encode("utf-8"))
 
                     # stream components
                     for node in graph.nodes:
