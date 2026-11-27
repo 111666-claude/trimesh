@@ -255,6 +255,131 @@ def handle_extensions(
 
 
 # ----------------------------------------------------------------------
+# KHR_texture_transform
+# ----------------------------------------------------------------------
+
+# glTF defaults for the extension, from:
+# https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_texture_transform
+_TEXTURE_TRANSFORM_DEFAULTS = {
+    "offset": (0.0, 0.0),
+    "rotation": 0.0,
+    "scale": (1.0, 1.0),
+}
+
+
+def parse_texture_transform(texture_info: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Read a `KHR_texture_transform` extension off a textureInfo object.
+
+    A textureInfo is any glTF value that references a texture via `index`,
+    i.e. `baseColorTexture`, `normalTexture`, and so on. The extension lives
+    in its `extensions` dict and may also override the texture coordinate set
+    with a `texCoord` integer, which shadows the textureInfo-level one.
+
+    Parameters
+    ----------
+    texture_info
+      A glTF textureInfo dict, e.g. the value of `baseColorTexture`.
+
+    Returns
+    -------
+    transform
+      Dict with float64 `offset` (2,), `scale` (2,), float `rotation` and
+      integer `tex_coord` (or None when not overridden). None when the
+      extension is absent or none of its values are usable, in which case
+      the caller must keep the old behavior rather than mutate any UVs.
+    """
+    if not isinstance(texture_info, dict):
+        return None
+    extensions = texture_info.get("extensions")
+    if not isinstance(extensions, dict):
+        return None
+    data = extensions.get("KHR_texture_transform")
+    if not isinstance(data, dict):
+        return None
+
+    try:
+        offset = np.asarray(
+            data.get("offset", _TEXTURE_TRANSFORM_DEFAULTS["offset"]),
+            dtype=np.float64,
+        )
+        scale = np.asarray(
+            data.get("scale", _TEXTURE_TRANSFORM_DEFAULTS["scale"]),
+            dtype=np.float64,
+        )
+        rotation = float(data.get("rotation", _TEXTURE_TRANSFORM_DEFAULTS["rotation"]))
+    except (TypeError, ValueError):
+        log.warning("KHR_texture_transform has malformed values, ignoring it")
+        return None
+
+    # both vectors must be flat two-component arrays, not nested rows
+    if offset.shape != (2,) or scale.shape != (2,):
+        log.warning("KHR_texture_transform offset/scale must be length-2 vectors")
+        return None
+
+    # a single NaN/Inf would propagate into every UV and scramble the texture
+    if not (
+        np.isfinite(offset).all() and np.isfinite(scale).all() and np.isfinite(rotation)
+    ):
+        log.warning("KHR_texture_transform has non-finite values, ignoring it")
+        return None
+
+    # texCoord on the extension shadows the textureInfo-level texCoord
+    tex_coord = data.get("texCoord", texture_info.get("texCoord", 0))
+    if tex_coord is not None:
+        try:
+            tex_coord = int(tex_coord)
+        except (TypeError, ValueError):
+            log.warning("KHR_texture_transform texCoord is not an integer, ignoring it")
+            return None
+        if tex_coord < 0:
+            log.warning(
+                "KHR_texture_transform texCoord %d is negative, ignoring it", tex_coord
+            )
+            return None
+
+    return {
+        "offset": offset,
+        "rotation": rotation,
+        "scale": scale,
+        "tex_coord": tex_coord,
+    }
+
+
+def apply_texture_transform(uv: NDArray, transform: dict[str, Any]) -> NDArray:
+    """
+    Apply a parsed `KHR_texture_transform` to texture coordinates.
+
+    Implements the extension matrix `T * R * S` from the glTF spec, operating
+    in glTF UV convention (origin upper-left) so callers must run this before
+    trimesh's own bottom-left V flip:
+
+        u' = offset.u + cos(r) * scale.u * u - sin(r) * scale.v * v
+        v' = offset.v + sin(r) * scale.u * u + cos(r) * scale.v * v
+
+    Parameters
+    ----------
+    uv
+      (n, 2) float texture coordinates in glTF convention.
+    transform
+      Dict produced by `parse_texture_transform`.
+
+    Returns
+    -------
+    transformed
+      (n, 2) float64 copy of the transformed UVs; the input is never mutated.
+    """
+    uv = np.asanyarray(uv, dtype=np.float64)
+    cos_r, sin_r = np.cos(transform["rotation"]), np.sin(transform["rotation"])
+    scale = transform["scale"]
+    # (2, 2) rotation * scale, then add the translation per row
+    matrix = np.array(
+        [[cos_r * scale[0], -sin_r * scale[1]], [sin_r * scale[0], cos_r * scale[1]]]
+    )
+    return uv @ matrix.T + transform["offset"]
+
+
+# ----------------------------------------------------------------------
 # Built-in handlers
 # ----------------------------------------------------------------------
 

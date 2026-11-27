@@ -110,6 +110,139 @@ class GLTFHandlerTest(g.unittest.TestCase):
         assert g.np.allclose(geom.vertices, filled)
 
 
+class TextureTransformTest(g.unittest.TestCase):
+    """KHR_texture_transform parsing and the spec UV matrix."""
+
+    def test_no_extension_returns_none(self):
+        # plain textureInfo objects must be left on the old code path
+        assert ext.parse_texture_transform({"index": 0}) is None
+        assert ext.parse_texture_transform({}) is None
+        assert ext.parse_texture_transform(None) is None
+
+    def test_defaults_are_identity(self):
+        # an empty extension object applies the spec defaults: no movement
+        transform = ext.parse_texture_transform(
+            {"extensions": {"KHR_texture_transform": {}}}
+        )
+        assert g.np.allclose(transform["offset"], [0.0, 0.0])
+        assert g.np.allclose(transform["scale"], [1.0, 1.0])
+        assert transform["rotation"] == 0.0
+        assert transform["tex_coord"] == 0
+
+        uv = g.np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 0.5]])
+        assert g.np.allclose(ext.apply_texture_transform(uv, transform), uv)
+
+    def test_offset_u(self):
+        # the Khronos TextureTransformTest Offset U case: the first UV's
+        # U component moves from 0 to 0.5
+        transform = ext.parse_texture_transform(
+            {"extensions": {"KHR_texture_transform": {"offset": [0.5, 0.0]}}}
+        )
+        uv = g.np.array([[0.0, 0.0], [1.0, 1.0]])
+        result = ext.apply_texture_transform(uv, transform)
+        assert g.np.allclose(result[0], [0.5, 0.0])
+        assert g.np.allclose(result[1], [1.5, 1.0])
+        # the input array must never be mutated
+        assert g.np.allclose(uv, g.np.array([[0.0, 0.0], [1.0, 1.0]]))
+
+    def test_combined_matches_spec_formula(self):
+        # u' = ou + cos*su*u - sin*sv*v ; v' = ov + sin*su*u + cos*sv*v
+        transform = ext.parse_texture_transform(
+            {
+                "extensions": {
+                    "KHR_texture_transform": {
+                        "offset": [-0.2, -0.1],
+                        "rotation": 0.3,
+                        "scale": [1.5, 1.5],
+                    }
+                }
+            }
+        )
+        uv = g.np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+        offset, rotation, scale = (
+            transform["offset"],
+            transform["rotation"],
+            transform["scale"],
+        )
+        c, s = g.np.cos(rotation), g.np.sin(rotation)
+        expected = g.np.column_stack(
+            [
+                offset[0] + c * scale[0] * uv[:, 0] - s * scale[1] * uv[:, 1],
+                offset[1] + s * scale[0] * uv[:, 0] + c * scale[1] * uv[:, 1],
+            ]
+        )
+        assert g.np.allclose(ext.apply_texture_transform(uv, transform), expected)
+
+    def test_tex_coord_override(self):
+        # the extension's texCoord shadows the textureInfo-level one
+        transform = ext.parse_texture_transform(
+            {
+                "texCoord": 0,
+                "extensions": {"KHR_texture_transform": {"texCoord": 1}},
+            }
+        )
+        assert transform["tex_coord"] == 1
+
+        # without an extension-level value the textureInfo default is used
+        transform = ext.parse_texture_transform(
+            {"texCoord": 2, "extensions": {"KHR_texture_transform": {}}}
+        )
+        assert transform["tex_coord"] == 2
+
+    def test_non_finite_values_rejected(self):
+        for bad in (
+            {"offset": [g.np.nan, 0.0]},
+            {"scale": [1.0, g.np.inf]},
+            {"rotation": g.np.inf},
+        ):
+            assert (
+                ext.parse_texture_transform(
+                    {"extensions": {"KHR_texture_transform": bad}}
+                )
+                is None
+            )
+
+    def test_illegal_tex_coord_rejected(self):
+        assert (
+            ext.parse_texture_transform(
+                {"extensions": {"KHR_texture_transform": {"texCoord": -1}}}
+            )
+            is None
+        )
+        assert (
+            ext.parse_texture_transform(
+                {"extensions": {"KHR_texture_transform": {"texCoord": "nope"}}}
+            )
+            is None
+        )
+
+    def test_malformed_values_rejected(self):
+        # wrong vector lengths, nested junk and non-numeric scalars must all
+        # degrade to "no transform" rather than raising into the loader
+        for bad in (
+            {"offset": [1.0]},
+            {"offset": [1.0, 2.0, 3.0]},
+            {"scale": [[1.0], [1.0]]},
+            {"rotation": "wide"},
+            {"offset": "nope"},
+        ):
+            assert (
+                ext.parse_texture_transform(
+                    {"extensions": {"KHR_texture_transform": bad}}
+                )
+                is None
+            )
+
+        # a malformed extension entry must be ignored, not crash parsing
+        assert (
+            ext.parse_texture_transform({"extensions": {"KHR_texture_transform": "junk"}})
+            is None
+        )
+        assert (
+            ext.parse_texture_transform({"extensions": {"other_extension": {}}}) is None
+        )
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     g.unittest.main()

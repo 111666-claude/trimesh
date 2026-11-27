@@ -22,7 +22,12 @@ from ...scene.cameras import Camera
 from ...scene.transforms import DEFAULT_BASE_FRAME
 from ...typed import NDArray, Stream
 from ...util import triangle_strips_to_faces, unique_name
-from .extensions import handle_extensions, unregistered
+from .extensions import (
+    apply_texture_transform,
+    handle_extensions,
+    parse_texture_transform,
+    unregistered,
+)
 
 # magic numbers which have meaning in GLTF
 # most are uint32's of UTF-8 text
@@ -1460,7 +1465,16 @@ def _parse_materials(header, views, resolver=None):
             # save flattened keys we can use for kwargs
             pbr = parse_textures(data=loopable)
             # create a PBR material object for the GLTF material
-            materials.append(visual.material.PBRMaterial(**pbr))
+            material = visual.material.PBRMaterial(**pbr)
+
+            # KHR_texture_transform lives on the baseColorTexture textureInfo
+            # and is applied to UVs per primitive, so carry it on the material
+            base_color = loopable.get("baseColorTexture")
+            if isinstance(base_color, dict):
+                transform = parse_texture_transform(base_color)
+                if transform is not None:
+                    material.baseColorTextureTransform = transform
+            materials.append(material)
 
     return materials
 
@@ -1720,15 +1734,50 @@ def _read_buffers(
                         if materials is None:
                             log.debug("no materials! `pip install pillow`")
                         else:
+                            material = materials[p["material"]]
+                            # KHR_texture_transform may select a different
+                            # TEXCOORD set than the default TEXCOORD_0
+                            transform = material.baseColorTextureTransform
+                            tex_name = (
+                                f"TEXCOORD_{transform['tex_coord']}"
+                                if transform is not None
+                                else "TEXCOORD_0"
+                            )
                             uv = None
-                            if "TEXCOORD_0" in attr:
+                            if tex_name in attr:
+                                # work on a copy: accessors are shared and
+                                # must never be mutated for one material
+                                uv = access[attr[tex_name]].copy()
+                                if transform is not None:
+                                    try:
+                                        # the extension is defined in glTF UV
+                                        # convention (origin upper-left), so
+                                        # apply it before trimesh's V flip
+                                        uv = apply_texture_transform(uv, transform)
+                                    except BaseException:
+                                        # contain failures to this material:
+                                        # drop its UVs instead of scrambling the
+                                        # whole mesh or leaking into neighbors
+                                        log.debug(
+                                            "failed to apply texture transform",
+                                            exc_info=True,
+                                        )
+                                        uv = None
+                            elif transform is not None:
+                                # an out-of-range coordinate set leaves this
+                                # material without UVs rather than borrowing
+                                # another material's transformed coordinates
+                                log.warning(
+                                    "`%s` referenced by KHR_texture_transform is missing from primitive attributes",
+                                    tex_name,
+                                )
+                            if uv is not None:
                                 # flip UV's top- bottom to move origin to lower-left:
                                 # https://github.com/KhronosGroup/glTF/issues/1021
-                                uv = access[attr["TEXCOORD_0"]].copy()
                                 uv[:, 1] = 1.0 - uv[:, 1]
-                                # create a texture visual
+                            # create a texture visual
                             visuals = visual.texture.TextureVisuals(
-                                uv=uv, material=materials[p["material"]]
+                                uv=uv, material=material
                             )
 
                     if "COLOR_0" in attr:

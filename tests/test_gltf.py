@@ -53,6 +53,128 @@ def validate_glb(data, name=None):
         raise ValueError("gltf_validator failed")
 
 
+def _texture_transform_gltf(materials, *, uv_sets=("uv0", "uv1")):
+    """
+    Build a minimal in-memory glTF of one quad split into two triangles.
+
+    Parameters
+    ----------
+    materials
+      Sequence of material dicts to emit, each containing a
+      `baseColorTexture` textureInfo (with an optional
+      KHR_texture_transform extension). Primitive `i` references material `i`.
+    uv_sets
+      Which TEXCOORD sets to include on every primitive, as accessor names.
+
+    Returns
+    -------
+    stream
+      BytesIO of the JSON glTF with all data in data URIs.
+    """
+    try:
+        import PIL.Image
+    except ImportError:
+        return None
+
+    # 4 vertices, the same geometry for every primitive
+    positions = g.np.array(
+        [[-0.5, -0.5, 0], [0.5, -0.5, 0], [0.5, 0.5, 0], [-0.5, 0.5, 0]],
+        dtype=g.np.float32,
+    )
+    # two distinct UV sets so texCoord overrides are observable
+    uv0 = g.np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=g.np.float32)
+    uv1 = g.np.array([[0, 0], [0.5, 0], [0.5, 0.5], [0, 0.5]], dtype=g.np.float32)
+    indices = g.np.array([0, 1, 2, 0, 2, 3], dtype=g.np.uint32)
+
+    blob = g.io.BytesIO()
+    PIL.Image.new("RGBA", (4, 4), (255, 0, 0, 255)).save(blob, format="PNG")
+    image_uri = "data:image/png;base64," + g.base64.b64encode(blob.getvalue()).decode()
+
+    arrays = {"positions": positions, "uv0": uv0, "uv1": uv1, "indices": indices}
+    buffer = g.io.BytesIO()
+    views = []
+    accessors = []
+
+    def add_view(array):
+        start = buffer.tell()
+        raw = (
+            array.astype(g.np.float32).tobytes()
+            if array.dtype.kind == "f"
+            else array.tobytes()
+        )
+        buffer.write(raw)
+        views.append(
+            {
+                "buffer": 0,
+                "byteOffset": start,
+                "byteLength": len(raw),
+            }
+        )
+        component_type = 5126 if array.dtype.kind == "f" else 5125
+        gltf_type = {1: "SCALAR", 2: "VEC2", 3: "VEC3"}[
+            array.shape[1] if array.ndim > 1 else 1
+        ]
+        accessors.append(
+            {
+                "bufferView": len(views) - 1,
+                "componentType": component_type,
+                "count": len(array),
+                "type": gltf_type,
+            }
+        )
+        return len(accessors) - 1
+
+    position_acc = add_view(arrays["positions"])
+    uv_acc = {name: add_view(arrays[name]) for name in uv_sets}
+    index_acc = add_view(arrays["indices"])
+
+    raw = buffer.getvalue()
+    uri = "data:application/octet-stream;base64," + g.base64.b64encode(raw).decode()
+
+    primitives = []
+    for material_index, _material in enumerate(materials):
+        attributes = {"POSITION": position_acc}
+        for name, acc in uv_acc.items():
+            attributes["TEXCOORD_" + name[2:]] = acc
+        primitives.append(
+            {
+                "attributes": attributes,
+                "indices": index_acc,
+                "material": material_index,
+                "mode": 4,
+            }
+        )
+
+    tree = {
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": primitives}],
+        "materials": materials,
+        "images": [{"uri": image_uri}],
+        "textures": [{"source": 0}],
+        "accessors": accessors,
+        "bufferViews": views,
+        "buffers": [{"byteLength": len(raw), "uri": uri}],
+    }
+    if any(
+        "extensions" in (m.get("pbrMetallicRoughness", {}).get("baseColorTexture") or {})
+        for m in materials
+    ):
+        tree["extensionsUsed"] = ["KHR_texture_transform"]
+    return g.trimesh.util.wrap_as_stream(g.json.dumps(tree).encode("utf-8"))
+
+
+def _base_color_texture(transform=None, tex_coord=None):
+    texture_info = {"index": 0}
+    if tex_coord is not None:
+        texture_info["texCoord"] = tex_coord
+    if transform is not None:
+        texture_info["extensions"] = {"KHR_texture_transform": transform}
+    return {"pbrMetallicRoughness": {"baseColorTexture": texture_info}}
+
+
 load_kwargs = g.trimesh.exchange.load._load_kwargs
 
 
@@ -1332,6 +1454,115 @@ class GLTFTest(g.unittest.TestCase):
         # if they are much different this number will be absolutely huge
         mean_squared_error = ((a - b) ** 2).sum() / g.np.prod(a.shape)
         assert mean_squared_error < 10.0
+
+    def test_texture_transform_offset_u(self):
+        # mirrors the Khronos TextureTransformTest "Offset U" case
+        stream = _texture_transform_gltf(
+            [_base_color_texture(transform={"offset": [0.5, 0.0]})]
+        )
+        if stream is None:
+            return  # pillow unavailable
+
+        scene = g.trimesh.load(stream, file_type="gltf", process=False)
+        geom = next(iter(scene.geometry.values()))
+
+        # source first UV is (0, 0); after the offset U is 0.5
+        uv = geom.visual.uv
+        assert g.np.allclose(uv[0], [0.5, 1.0])
+        # V is still flipped to trimesh's bottom-left convention
+        assert g.np.allclose(uv[:, 1], 1.0 - g.np.array([0, 0, 1, 1]))
+
+    def test_texture_transform_combined(self):
+        # offset + rotation + scale together, checked against the spec matrix
+        transform = {"offset": [-0.2, -0.1], "rotation": 0.3, "scale": [1.5, 1.5]}
+        stream = _texture_transform_gltf([_base_color_texture(transform=transform)])
+        if stream is None:
+            return
+
+        scene = g.trimesh.load(stream, file_type="gltf", process=False)
+        geom = next(iter(scene.geometry.values()))
+        source = g.np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
+
+        c, s = g.np.cos(0.3), g.np.sin(0.3)
+        expected_u = -0.2 + c * 1.5 * source[:, 0] - s * 1.5 * source[:, 1]
+        expected_v = -0.1 + s * 1.5 * source[:, 0] + c * 1.5 * source[:, 1]
+
+        assert g.np.allclose(geom.visual.uv[:, 0], expected_u)
+        assert g.np.allclose(geom.visual.uv[:, 1], 1.0 - expected_v)
+
+    def test_texture_transform_tex_coord_override(self):
+        # extension selects TEXCOORD_1 instead of the default TEXCOORD_0
+        stream = _texture_transform_gltf(
+            [_base_color_texture(transform={"texCoord": 1, "offset": [0.5, 0.0]})]
+        )
+        if stream is None:
+            return
+
+        scene = g.trimesh.load(stream, file_type="gltf", process=False)
+        geom = next(iter(scene.geometry.values()))
+
+        # source is the UV1 set (0.5-wide), offset only shifts U
+        assert g.np.allclose(geom.visual.uv[0], [0.5, 1.0])
+        assert g.np.allclose(geom.visual.uv[1], [1.0, 1.0])
+
+    def test_texture_transform_does_not_pollute_other_materials(self):
+        # two primitives, two materials: only the first carries a transform
+        stream = _texture_transform_gltf(
+            [
+                _base_color_texture(transform={"offset": [0.5, 0.0]}),
+                _base_color_texture(),
+            ]
+        )
+        if stream is None:
+            return
+
+        scene = g.trimesh.load(stream, file_type="gltf", process=False)
+        geoms = list(scene.geometry.values())
+        transformed, plain = geoms[0], geoms[1]
+
+        assert transformed.visual.material.baseColorTextureTransform is not None
+        assert plain.visual.material.baseColorTextureTransform is None
+
+        # plain material keeps the legacy UVs (only V flipped)
+        assert g.np.allclose(
+            plain.visual.uv,
+            g.np.array([[0, 1], [1, 1], [1, 0], [0, 0]], dtype=float),
+        )
+        # vertices and faces are untouched
+        assert g.np.allclose(transformed.vertices, plain.vertices)
+        assert g.np.array_equal(transformed.faces, plain.faces)
+
+    def test_texture_transform_missing_tex_coord_set(self):
+        # an out-of-range coordinate set warns and leaves UVs unset rather
+        # than borrowing another material's transformed coordinates
+        stream = _texture_transform_gltf(
+            [_base_color_texture(transform={"texCoord": 7})], uv_sets=("uv0",)
+        )
+        if stream is None:
+            return
+
+        with self.assertLogs("trimesh", level="WARNING") as cm:
+            scene = g.trimesh.load(stream, file_type="gltf", process=False)
+        geom = next(iter(scene.geometry.values()))
+        assert geom.visual.uv is None
+        assert any("TEXCOORD_7" in line for line in cm.output)
+
+    def test_texture_transform_non_finite_ignored(self):
+        # non-finite transform values are dropped at parse time, so the
+        # material behaves exactly like an unextended one
+        stream = _texture_transform_gltf(
+            [_base_color_texture(transform={"scale": [float("nan"), 1.0]})]
+        )
+        if stream is None:
+            return
+
+        scene = g.trimesh.load(stream, file_type="gltf", process=False)
+        geom = next(iter(scene.geometry.values()))
+        assert geom.visual.material.baseColorTextureTransform is None
+        assert g.np.allclose(
+            geom.visual.uv,
+            g.np.array([[0, 1], [1, 1], [1, 0], [0, 0]], dtype=float),
+        )
 
 
 if __name__ == "__main__":

@@ -321,6 +321,7 @@ class PBRMaterial(Material):
         occlusionTexture=None,
         baseColorTexture=None,
         metallicRoughnessTexture=None,
+        baseColorTextureTransform=None,
         doubleSided=False,
         alphaMode=None,
         alphaCutoff=None,
@@ -345,6 +346,9 @@ class PBRMaterial(Material):
         self.occlusionTexture = occlusionTexture
         self.baseColorTexture = baseColorTexture
         self.metallicRoughnessTexture = metallicRoughnessTexture
+
+        # dict parsed from KHR_texture_transform, or None
+        self.baseColorTextureTransform = baseColorTextureTransform
 
         # bool
         self.doubleSided = doubleSided
@@ -605,6 +609,31 @@ class PBRMaterial(Material):
         else:
             # non-None values must be RGBA color
             self._data["baseColorTexture"] = value
+
+    @property
+    def baseColorTextureTransform(self):
+        """
+        The `KHR_texture_transform` applied to the base color texture's
+        UV coordinates, as parsed by the glTF loader. Contains float64
+        `offset` (2,), `scale` (2,), float `rotation` and an integer
+        `tex_coord` selecting the TEXCOORD attribute set.
+
+        Returns
+        ----------
+        transform : dict or None
+          Texture transform parameters, or None when unused.
+        """
+        return self._data.get("baseColorTextureTransform")
+
+    @baseColorTextureTransform.setter
+    def baseColorTextureTransform(self, value):
+        if value is None:
+            # passing none effectively removes value
+            self._data.pop("baseColorTextureTransform", None)
+        elif isinstance(value, dict):
+            self._data["baseColorTextureTransform"] = value
+        else:
+            raise TypeError("baseColorTextureTransform must be a dict or None")
 
     @property
     def metallicRoughnessTexture(self):
