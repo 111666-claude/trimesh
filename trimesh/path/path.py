@@ -350,6 +350,10 @@ class Path(parent.Geometry):
         Return the centroid of axis aligned bounding box enclosing
         all entities of the path object.
 
+        Note that this is the center of the bounding box rather
+        than the centroid of the enclosed area: for that use
+        `path.area_centroid` on a `Path2D` or `Path3D`.
+
         Returns
         -----------
         centroid : (d,) float
@@ -965,6 +969,41 @@ class Path3D(Path):
         )
 
     @cache_decorator
+    def area_centroid(self) -> NDArray[float64] | None:
+        """
+        The centroid of the enclosed area of the 3D path.
+
+        Unlike `path.centroid`, which returns the center of the
+        axis aligned bounding box, this weights every enclosed
+        region by its area so a large region dominates a small
+        one and holes are subtracted.
+
+        Returns
+        ---------
+        area_centroid : (3,) float or None
+          Area weighted centroid moved back into the original
+          3D frame, or `None` if the path is open, isn't
+          planar, or encloses no area.
+        """
+        # move the path onto the XY plane, which fits a plane
+        # to the vertices if one isn't already known
+        try:
+            planar, to_3D = self.to_2D()
+        except ValueError:
+            # the vertices do not define a plane
+            return None
+
+        # the centroid in the 2D frame of the fitted plane
+        centroid = planar.area_centroid
+        if centroid is None:
+            return None
+
+        # move the 2D centroid back into the original frame
+        return tf.transform_points(
+            [np.append(centroid, 0.0)], matrix=to_3D, translate=True
+        )[0]
+
+    @cache_decorator
     def convex_hull(self):
         """
         Return a convex hull of the 3D path.
@@ -1258,6 +1297,28 @@ class Path2D(Path):
             full[i] = polygons.repair_invalid(Polygon(shell=shell, holes=holes))
 
         return full
+
+    @cache_decorator
+    def area_centroid(self) -> NDArray[float64] | None:
+        """
+        The centroid of the enclosed area of the 2D path.
+
+        Unlike `path.centroid`, which returns the center of the
+        axis aligned bounding box, this weights every enclosed
+        region by its area so a large region dominates a small
+        one and holes are subtracted.
+
+        Returns
+        ---------
+        area_centroid : (2,) float or None
+          Area weighted centroid of the polygons interior
+          or `None` if the path is open or encloses no area.
+        """
+        # an empty path has no bounds or polygons so `polygons_full`
+        # can't be evaluated: it encloses no area by definition
+        if self.is_empty or len(self.vertices) == 0:
+            return None
+        return polygons.area_centroid(self.polygons_full)
 
     @cache_decorator
     def area(self):

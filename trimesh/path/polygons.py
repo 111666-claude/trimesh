@@ -903,6 +903,71 @@ def projected(
         return reduced.buffer(padding).buffer(-padding)
 
 
+def area_centroid(
+    polygons: Iterable[Polygon | None],
+) -> NDArray[float64] | None:
+    """
+    The area weighted centroid of a set of polygons.
+
+    Unlike the center of the axis aligned bounding box this
+    weights every region by its enclosed area: interiors
+    (holes) are subtracted and disconnected regions
+    contribute in proportion to their size.
+
+    Parameters
+    -----------
+    polygons : (n,) shapely.geometry.Polygon
+      Polygons which may include interiors. Entries which
+      are `None` are ignored.
+
+    Returns
+    ----------
+    centroid : (2,) float or None
+      The area weighted centroid or `None` if the
+      polygons are empty or enclose no area.
+
+    Notes
+    ----------
+    A region whose area is below `tol.zero` multiplied by
+    its perimeter (i.e. narrower than `tol.zero`) is treated
+    as having zero area: this matches the area of a ring
+    which was collinear and recovered as a floating point
+    sliver.
+    """
+    if polygons is None:
+        return None
+
+    # collect the area and centroid of every region
+    areas = []
+    centroids = []
+    for polygon in polygons:
+        # `None` entries come from unrecoverable geometry
+        if polygon is None:
+            continue
+        area = float(polygon.area)
+        if not np.isfinite(area) or area <= 0.0:
+            continue
+
+        # a ring that encloses no area can still be "repaired" into
+        # a sliver with a tiny non-zero area: compare the area to
+        # `tol.zero` times the perimeter, i.e. the estimated width,
+        # so a genuinely thin but well-defined region is still kept
+        if area <= tol.zero * float(polygon.length):
+            continue
+
+        areas.append(area)
+        # only use the planar coordinates even if the input
+        # shapely geometry carries a Z value
+        centroids.append(polygon.centroid.coords[0][:2])
+
+    if len(areas) == 0:
+        return None
+
+    return np.average(
+        np.array(centroids), weights=np.array(areas, dtype=np.float64), axis=0
+    )
+
+
 def second_moments(polygon: Polygon, return_centered=False):
     """
     Calculate the second moments of area of a polygon

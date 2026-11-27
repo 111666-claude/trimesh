@@ -363,6 +363,46 @@ def test_polygons_full_none():
     assert g.np.isclose(full[1].area, square.area)
 
 
+def test_area_centroid():
+    # two disjoint squares with a 4:1 area ratio: the area weighted
+    # centroid should not be the center of the bounding box
+    polygons = [
+        g.Polygon([(-1, -1), (1, -1), (1, 1), (-1, 1)]),
+        g.Polygon([(3.5, -0.5), (4.5, -0.5), (4.5, 0.5), (3.5, 0.5)]),
+    ]
+    centroid = g.trimesh.path.polygons.area_centroid(polygons)
+    assert g.np.allclose(centroid, [0.8, 0.0])
+
+    # an off-center hole should be weighted out of the area
+    donut = g.Polygon(
+        shell=[(-2, -2), (2, -2), (2, 2), (-2, 2)],
+        holes=[[(0.5, -0.5), (1.5, -0.5), (1.5, 0.5), (0.5, 0.5)]],
+    )
+    centroid = g.trimesh.path.polygons.area_centroid([donut])
+    assert g.np.allclose(centroid, g.np.array(donut.centroid.coords)[0])
+
+    # `None` entries are skipped and no polygons means no centroid
+    assert g.np.allclose(
+        g.trimesh.path.polygons.area_centroid([None, polygons[0]]), [0.0, 0.0]
+    )
+    assert g.trimesh.path.polygons.area_centroid([]) is None
+    assert g.trimesh.path.polygons.area_centroid(None) is None
+
+    # a degenerate polygon encloses no area so has no centroid
+    assert (
+        g.trimesh.path.polygons.area_centroid(
+            [g.Polygon([(0, 0), (1, 0), (2, 0), (0, 0)])]
+        )
+        is None
+    )
+
+    # a genuinely thin but finite sheet still has a defined centroid
+    thin = g.trimesh.path.polygons.paths_to_polygons(
+        [g.np.array([[0, 0], [1e6, 0], [1e6, 1e-5], [0, 1e-5], [0, 0]])]
+    )[0]
+    assert g.np.allclose(g.trimesh.path.polygons.area_centroid([thin]), [5e5, 5e-6])
+
+
 if __name__ == "__main__":
     g.trimesh.util.attach_to_log()
     test_polygon_sample()

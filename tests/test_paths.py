@@ -358,6 +358,167 @@ def test_split():
             g.check_path2D(s)
 
 
+def _loops(centers, widths):
+    """
+    Build closed square boundaries.
+
+    Parameters
+    -----------
+    centers : (n, 2) float
+      Center of each square.
+    widths : (n,) float
+      Edge length of each square.
+
+    Returns
+    ---------
+    loops : (n,) list of (5, 2) float
+      Closed counter-clockwise square boundaries.
+    """
+    loops = []
+    for center, width in zip(centers, widths):
+        x, y = center
+        half = float(width) / 2.0
+        loops.append(
+            g.np.array(
+                [
+                    [x - half, y - half],
+                    [x + half, y - half],
+                    [x + half, y + half],
+                    [x - half, y + half],
+                    [x - half, y - half],
+                ],
+                dtype=g.np.float64,
+            )
+        )
+    return loops
+
+
+def _path(loops):
+    # build a Path2D from a list of closed loops so each
+    # loop is a single closed `Line` entity: the default
+    # processing merges the repeated end point of each loop
+    entities = []
+    current = 0
+    for loop in loops:
+        entities.append(g.trimesh.path.entities.Line(g.np.arange(len(loop)) + current))
+        current += len(loop)
+    return g.trimesh.path.Path2D(entities=entities, vertices=g.np.vstack(loops))
+
+
+def test_area_centroid():
+    # a 4:1 area ratio between two squares should weight the
+    # centroid towards the large square rather than the center
+    # of the axis aligned bounding box
+    path = _path(_loops([[0, 0], [4, 0]], [2, 1]))
+    assert g.np.isclose(path.area, 5.0)
+
+    # (4 * 0 + 1 * 4) / 5
+    assert g.np.allclose(path.area_centroid, [0.8, 0.0])
+    # the existing centroid is the bounding box center
+    assert g.np.allclose(path.centroid, [1.75, 0.0])
+    assert g.np.allclose(path.bounds.mean(axis=0), path.centroid)
+
+    # rotating the same geometry should rotate the centroid
+    angle = g.np.radians(30.0)
+    rotation = g.np.eye(3)
+    rotation[:2, :2] = [
+        [g.np.cos(angle), -g.np.sin(angle)],
+        [g.np.sin(angle), g.np.cos(angle)],
+    ]
+    rotated = _path(_loops([[0, 0], [4, 0]], [2, 1]))
+    rotated.apply_transform(rotation)
+    assert g.np.allclose(rotated.area_centroid, g.np.dot(rotation[:2, :2], [0.8, 0.0]))
+
+
+def test_area_centroid_hole():
+    # an off-center hole shifts the centroid away from the hole
+    loops = _loops([[0, 0], [1, 0]], [4, 1])
+    # wind the hole clockwise so it reads as an interior
+    loops[1] = loops[1][::-1]
+    path = _path(loops)
+
+    # the outer square is 16 and the hole is 1 so the centroid
+    # moves to (16 * 0 - 1 * 1) / 15
+    assert g.np.isclose(path.area, 15.0)
+    assert g.np.allclose(path.area_centroid, [-1.0 / 15.0, 0.0])
+
+    # the hole does not change the bounding box center,
+    # which stays at the center of the shell alone
+    assert g.np.allclose(path.centroid, [0.0, 0.0])
+
+
+def test_area_centroid_invalid():
+    # a path with no enclosed area has no area centroid
+    open_path = g.trimesh.load_path([[0, 0], [1, 0], [1, 1]])
+    assert not open_path.is_closed
+    assert open_path.area_centroid is None
+
+    # a closed but flat "loop" encloses zero area
+    flat = g.trimesh.path.Path2D(
+        entities=[g.trimesh.path.entities.Line([0, 1, 2, 0])],
+        vertices=[[0, 0], [1, 0], [2, 0], [0, 0]],
+    )
+    assert flat.area_centroid is None
+
+    # empty paths return `None` instead of raising
+    assert g.trimesh.path.Path2D().area_centroid is None
+    assert g.trimesh.path.Path3D().area_centroid is None
+
+
+def test_area_centroid_section():
+    # two boxes with a 4:1 area ratio in a cross section
+    small = g.trimesh.creation.box(extents=[1, 1, 4])
+    small.apply_translation([4, 0, 0])
+    mesh = g.trimesh.util.concatenate([g.trimesh.creation.box(extents=[2, 2, 4]), small])
+
+    section = mesh.section(plane_origin=[0, 0, 0], plane_normal=[0, 0, 1])
+    # the 3D centroid is the area weighted centroid of both boxes
+    assert g.np.allclose(section.area_centroid, [0.8, 0.0, 0.0])
+
+    # the planar centroid maps back to the same 3D point
+    planar, to_3D = section.to_2D()
+    assert g.np.allclose(planar.area_centroid, [-1.2, 0.0])
+    back = g.trimesh.transform_points([[*planar.area_centroid, 0.0]], to_3D)[0]
+    assert g.np.allclose(back, section.area_centroid)
+
+    # a section through a rotated mesh should still land on the
+    # transform of the un-rotated centroid
+    matrix = g.trimesh.transformations.rotation_matrix(
+        angle=g.np.radians(30.0), direction=g.trimesh.unitize([1.0, 2.0, 3.0])
+    )
+    rotated = mesh.copy()
+    rotated.apply_transform(matrix)
+    normal = g.trimesh.transform_points([[0, 0, 1]], matrix, translate=False)[0]
+    origin = g.trimesh.transform_points([[0, 0, 0.5]], matrix)[0]
+
+    inclined = rotated.section(plane_origin=origin, plane_normal=normal)
+    truth = g.trimesh.transform_points([[0.8, 0, 0.5]], matrix)[0]
+    assert g.np.allclose(inclined.area_centroid, truth)
+    # the bounding box center does not agree with the area centroid
+    assert not g.np.allclose(inclined.centroid, truth)
+
+
+def test_area_centroid_hole_section():
+    # a cross section with an off-center hole should weight the
+    # hole out of the enclosed area
+    shell = g.np.array([[-2, -2], [2, -2], [2, 2], [-2, 2], [-2, -2]], dtype=g.np.float64)
+    hole = g.np.array([[1, -0.5], [1.8, -0.5], [1.8, 0.5], [1, 0.5], [1, -0.5]])
+    donut = g.Polygon(shell=shell, holes=[hole])
+
+    mesh = g.trimesh.creation.extrude_polygon(donut, height=2)
+    section = mesh.section(plane_origin=[0, 0, 1], plane_normal=[0, 0, 1])
+
+    # the section should match the polygon it was made from
+    truth = g.np.array(donut.centroid.coords)[0]
+    assert g.np.allclose(section.area_centroid[:2], truth, atol=1e-8)
+    assert g.np.isclose(section.area_centroid[2], 1.0)
+
+    # and the planar version should agree after the transform
+    planar, to_3D = section.to_2D()
+    back = g.trimesh.transform_points([[*planar.area_centroid, 0.0]], to_3D)[0]
+    assert g.np.allclose(back, section.area_centroid)
+
+
 def test_section():
     mesh = g.get_mesh("tube.obj")
 
