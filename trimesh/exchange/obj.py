@@ -115,9 +115,19 @@ def load_obj(
     if group_material or split_objects or split_groups:
         face_tuples = _group_by(face_tuples, group_material, split_objects, split_groups)
 
-    # no faces but points given
+    # parse the `l` line elements into object/group chunks
+    # unlike faces these become `Path3D` geometry rather than
+    # meshes, and this call validates their indices
+    line_groups = _group_line_tuples(
+        _parse_line_tuples(text),
+        group_material=group_material,
+        split_objects=split_objects,
+        split_groups=split_groups,
+    )
+
+    # no faces or lines but points given
     # return point cloud
-    if not len(face_tuples) and v is not None:
+    if not len(face_tuples) and not len(line_groups) and v is not None:
         pc = {"vertices": v}
         if vn is not None:
             pc["vertex_normals"] = vn
@@ -132,6 +142,11 @@ def load_obj(
     geometry = {}
     # guard against None vertices (e.g. malformed OBJ with mixed vertex formats)
     if v is None:
+        if len(line_groups) > 0:
+            # line elements reference vertices so this is malformed
+            raise OBJLineIndexError(
+                "OBJ contains `l` line elements but no `v` vertices were found"
+            )
         log.debug("no vertices found, skipping geometry")
         return {"geometry": {}, "graph": []}
     while len(face_tuples) > 0:
@@ -183,31 +198,17 @@ def load_obj(
             faces, faces_tex, faces_norm = _parse_faces_fallback(face_lines)
 
         # build name from components
-        name_parts = []
-        if split_objects and current_object is not None:
-            name_parts.append(current_object)
-        if split_groups and current_group is not None:
-            name_parts.append(current_group)
-        if group_material and len(materials) > 1 and material is not None:
-            name_parts.append(str(material))
-
-        # join parts or fall back to defaults
-        if name_parts:
-            name = "_".join(name_parts)
-        elif current_object is not None:
-            name = current_object
-        else:
-            # try to use the file name from the resolver
-            # or file object if possible before defaulting
-            name = next(
-                i
-                for i in (
-                    getattr(resolver, "file_name", None),
-                    getattr(file_obj, "name", None),
-                    "geometry",
-                )
-                if i is not None
-            )
+        name = _obj_geometry_name(
+            current_object=current_object,
+            current_group=current_group,
+            material=material,
+            split_objects=split_objects,
+            split_groups=split_groups,
+            group_material=group_material,
+            materials=materials,
+            file_obj=file_obj,
+            resolver=resolver,
+        )
 
         # ensure the name is always unique in the geometry dict
         name = util.unique_name(name, geometry)
@@ -313,6 +314,32 @@ def load_obj(
         mesh["visual"] = visual
         # store geometry by name
         geometry[name] = mesh
+
+    # add one Path3D per object/group chunk of `l` line elements
+    for line_group in line_groups:
+        # build the same name the face meshes would use
+        name = _obj_geometry_name(
+            current_object=line_group["obj"],
+            current_group=line_group["group"],
+            material=line_group["material"],
+            split_objects=split_objects,
+            split_groups=split_groups,
+            group_material=group_material,
+            materials=materials,
+            file_obj=file_obj,
+            resolver=resolver,
+        )
+        # meshes and lines share the geometry dict so make
+        # sure the path gets its own unique key rather than
+        # overwriting a mesh (lines are never disguised as faces)
+        name = util.unique_name(name, geometry)
+
+        # convert the resolved index strips into Path3D kwargs
+        path_kwargs = _line_group_to_kwargs(
+            strips=line_group["strips"], vertices=v, kwargs=kwargs
+        )
+        # store the path geometry by name
+        geometry[name] = path_kwargs
 
     # add an identity transform for every geometry
     graph = [{"geometry": k, "frame_to": k} for k in geometry.keys()]
@@ -713,6 +740,298 @@ def _group_by(face_tuples, use_mtl: bool, use_obj: bool, use_group: bool):
         grouped[key][3] = "\n".join(grouped[key][3])
     # return as list
     return list(grouped.values())
+
+
+class OBJLineParseError(ValueError):
+    """
+    Raised when a Wavefront OBJ `l` line element is malformed,
+    for example it contains fewer than two vertex references
+    or an index that cannot be parsed as an integer.
+    """
+
+
+class OBJLineIndexError(IndexError, OBJLineParseError):
+    """
+    Raised when an OBJ `l` element references a vertex index
+    that is zero or out of bounds.
+
+    This subclasses both ``IndexError`` and ``ValueError`` so
+    callers catching either conventional error type get a
+    clear explanation rather than an opaque numpy indexing error.
+    """
+
+
+def _obj_geometry_name(
+    current_object,
+    current_group,
+    material,
+    split_objects,
+    split_groups,
+    group_material,
+    materials,
+    file_obj=None,
+    resolver=None,
+):
+    """
+    Build the geometry name for a chunk of OBJ data from the
+    current object, group, and material directives.
+
+    This is shared by face meshes and `l` line paths so that
+    object/group separation names both geometry types the same way.
+
+    Returns
+    -----------
+    name : str
+      A non-empty candidate name (not yet de-duplicated).
+    """
+    # build name from components
+    name_parts = []
+    if split_objects and current_object is not None:
+        name_parts.append(current_object)
+    if split_groups and current_group is not None:
+        name_parts.append(current_group)
+    if group_material and len(materials) > 1 and material is not None:
+        name_parts.append(str(material))
+
+    # join parts or fall back to defaults
+    if name_parts:
+        return "_".join(name_parts)
+    if current_object is not None:
+        return current_object
+    # try to use the file name from the resolver
+    # or file object if possible before defaulting
+    return next(
+        i
+        for i in (
+            getattr(resolver, "file_name", None),
+            getattr(file_obj, "name", None),
+            "geometry",
+        )
+        if i is not None
+    )
+
+
+def _parse_line_tuples(text):
+    """
+    Parse the `l` line elements of a Wavefront OBJ document.
+
+    Each `l` statement lists an ordered run of vertex references::
+
+        l v1[/vt1] v2[/vt2] v3[/vt3] ...
+
+    Consecutive references form an ordered polyline. Positive
+    indices are 1-based absolute references and negative indices
+    count backwards from the vertices defined so far (`-1` is
+    the most recently defined vertex). Optional texture indices
+    after a `/` are accepted and ignored.
+
+    Parameters
+    -------------
+    text : str
+      Full OBJ text with newlines normalized and line
+      continuations already collapsed.
+
+    Returns
+    -------------
+    line_tuples : (n,) list of (material, obj, group, indices)
+      One tuple per `l` statement where `indices` is an int64
+      array of resolved non-negative 0-based vertex indices.
+
+    Raises
+    -------------
+    OBJLineParseError
+      If an `l` statement has fewer than two references or a
+      reference cannot be parsed as an integer.
+    OBJLineIndexError
+      If a vertex index is zero or out of bounds.
+    """
+    # fast exit for the overwhelmingly common case of files
+    # that do not contain any line elements
+    if re.search(r"(?m)^\s*l(?:\s|$)", text) is None:
+        return []
+
+    # current directive state
+    current_obj = None
+    current_group = None
+    current_material = None
+    # number of `v` vertices seen so far, used to resolve
+    # negative indices against their running definition point
+    vertex_count = 0
+
+    line_tuples = []
+
+    for line_number, raw_line in enumerate(text.split("\n"), start=1):
+        line = raw_line.strip()
+        if len(line) == 0 or line.startswith("#"):
+            continue
+
+        # split off the directive token without requiring
+        # every (potentially huge face) line to be fully split
+        if line[0] == "v" and (len(line) == 1 or line[1].isspace()):
+            # a `v` vertex position line (not `vt` or `vn`)
+            vertex_count += 1
+            continue
+        if line.startswith("o") and (len(line) == 1 or line[1].isspace()):
+            current_obj = line[1:].strip() or None
+            continue
+        if line.startswith("g") and (len(line) == 1 or line[1].isspace()):
+            # an OBJ `g` line may name multiple groups but the
+            # face loader treats the remainder as one name, so
+            # mirror that behavior for consistent geometry names
+            current_group = line[1:].strip() or None
+            continue
+        if line.startswith("usemtl") and (len(line) == 6 or line[6].isspace()):
+            current_material = line[6:].strip() or None
+            continue
+        if not (line.startswith("l") and (len(line) == 1 or line[1].isspace())):
+            # not a line element
+            continue
+
+        # this is an `l` element: drop any inline comment then
+        # split into vertex references
+        references = line.split("#", 1)[0].split()[1:]
+        if len(references) < 2:
+            raise OBJLineParseError(
+                f"OBJ line element on line {line_number} must reference at least 2 vertices (a line segment needs two), got {len(references)}: {line!r}"
+            )
+
+        indices = []
+        for reference in references:
+            # references are `v`, `v/vt`, or possibly `v//vn`
+            # for lines only the leading vertex index matters
+            vertex_token = reference.split("/", 1)[0]
+            try:
+                raw_index = int(vertex_token)
+            except (TypeError, ValueError):
+                raise OBJLineParseError(
+                    f"invalid or malformed OBJ line element on line {line_number}: could not parse vertex index {reference!r} in {line!r}"
+                )
+
+            if raw_index == 0:
+                raise OBJLineIndexError(
+                    f"invalid OBJ line vertex index 0 on line {line_number} (indices are 1-based): {line!r}"
+                )
+
+            if raw_index > 0:
+                # positive indices are 1-based absolute references
+                resolved = raw_index - 1
+            else:
+                # negative indices count back from the vertices
+                # defined at this point in the file
+                resolved = vertex_count + raw_index
+
+            if resolved < 0 or resolved >= vertex_count:
+                raise OBJLineIndexError(
+                    f"invalid OBJ line vertex index {raw_index!r} on line {line_number} is out of bounds with {vertex_count} vertices defined: {line!r}"
+                )
+            indices.append(resolved)
+
+        line_tuples.append(
+            (
+                current_material,
+                current_obj,
+                current_group,
+                np.asarray(indices, dtype=np.int64),
+            )
+        )
+
+    return line_tuples
+
+
+def _group_line_tuples(
+    line_tuples, group_material=True, split_objects=False, split_groups=False
+):
+    """
+    Group parsed `l` tuples by the same material/object/group key
+    used for face chunks, collecting every ordered strip in a
+    chunk into one Path3D geometry.
+
+    Returns
+    -------------
+    groups : (n,) list of dict
+      Each dict has keys `material`, `obj`, `group`, `strips`
+      where `strips` is a list of int64 index arrays.
+    """
+    grouped = defaultdict(
+        lambda: {"material": None, "obj": None, "group": None, "strips": []}
+    )
+
+    for material, obj, group, indices in line_tuples:
+        key = (
+            material if group_material else None,
+            obj if split_objects else None,
+            group if split_groups else None,
+        )
+        bundle = grouped[key]
+        # keep the first directive seen for this bundle so the
+        # un-split default names the first object/group just
+        # like the face chunk path does
+        if bundle["material"] is None:
+            bundle["material"] = material
+        if bundle["obj"] is None:
+            bundle["obj"] = obj
+        if bundle["group"] is None:
+            bundle["group"] = group
+        bundle["strips"].append(indices)
+
+    return list(grouped.values())
+
+
+def _line_group_to_kwargs(strips, vertices, kwargs=None):
+    """
+    Convert the ordered index strips of one line group into
+    keyword arguments for a `trimesh.path.Path3D`.
+
+    Every pair of consecutive indices in an OBJ `l` statement
+    becomes one ordered `Line` segment, so a three vertex strip
+    `l a b c` produces the two segments `(a, b)` and `(b, c)`.
+    Vertices are subset to the ones referenced by this group and
+    the indices are remapped into that subset so the path only
+    carries its own attributed vertices.
+
+    Parameters
+    -------------
+    strips : (n,) list of (k,) int64
+      Resolved global 0-based index arrays, one per `l` statement.
+    vertices : (m, 3) float
+      The full OBJ vertex array.
+    kwargs : dict or None
+      Extra loader keyword arguments (e.g. `process`) to pass
+      through to the Path3D constructor.
+
+    Returns
+    -------------
+    path_kwargs : dict
+      Keys `vertices` and `entities` plus any passthrough kwargs.
+    """
+    from ..path.entities import Line
+
+    if len(strips) == 1:
+        flat = strips[0]
+    else:
+        flat = np.concatenate(strips)
+
+    # global vertices referenced by this group
+    used = np.unique(flat)
+
+    # remap global indices into the subset vertex array
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used), dtype=np.int64)
+
+    entities = []
+    for strip in strips:
+        local = remap[strip]
+        # each adjacent index pair is one ordered segment
+        entities.extend(Line(points=[a, b]) for a, b in itertools.pairwise(local))
+
+    path_kwargs = dict(kwargs or {})
+    path_kwargs.update(
+        {
+            "vertices": np.asarray(vertices)[used].copy(),
+            "entities": entities,
+        }
+    )
+    return path_kwargs
 
 
 def _preprocess_faces(text, use_obj=False, use_groups=False):
